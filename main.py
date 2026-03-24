@@ -407,6 +407,42 @@ class Database:
         )
         return cur.fetchall()
 
+    def get_item_report(self, item_name: str, date_from: str, date_to: str,
+                        store: str | None = None):
+        """Return (total_qty, total_revenue) for a named item between two ISO dates."""
+        if store:
+            rows = self.conn.execute(
+                "SELECT items_json FROM transactions WHERE date >= ? AND date <= ? AND store = ?",
+                (date_from, date_to, store),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT items_json FROM transactions WHERE date >= ? AND date <= ?",
+                (date_from, date_to),
+            ).fetchall()
+        total_qty = 0
+        total_rev = 0.0
+        for (items_json,) in rows:
+            for it in json.loads(items_json):
+                if it["name"].strip().lower() == item_name.strip().lower():
+                    total_qty += it["qty"]
+                    total_rev += it["price"] * it["qty"]
+        return total_qty, total_rev
+
+    def get_all_item_names(self, store: str | None = None) -> list[str]:
+        """Return sorted unique item names from all transactions."""
+        if store:
+            rows = self.conn.execute(
+                "SELECT items_json FROM transactions WHERE store = ?", (store,)
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT items_json FROM transactions").fetchall()
+        names = set()
+        for (items_json,) in rows:
+            for it in json.loads(items_json):
+                names.add(it["name"])
+        return sorted(names)
+
     def delete_product(self, id):
         self.conn.execute("DELETE FROM products WHERE id=?", (id,))
         self.conn.commit()
@@ -1211,6 +1247,17 @@ class BlazeBiteApp(ctk.CTk):
 
         self._build_user_management(user_frame)
 
+        # ── Item Sales Report ──
+        ctk.CTkLabel(parent, text="📈  Item Sales Report",
+                     font=ctk.CTkFont("Helvetica", 16, "bold"),
+                     text_color=COLORS["text_primary"]).pack(anchor="w", padx=20, pady=(16, 8))
+
+        report_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"],
+                                    corner_radius=10, border_width=1,
+                                    border_color=COLORS["border"])
+        report_frame.pack(fill="x", padx=16, pady=(0, 12))
+        self._build_item_report_panel(report_frame)
+
         # Logout button
         logout_btn = ctk.CTkButton(parent, text="🚪 Logout Admin", height=40, fg_color=COLORS["error"], hover_color="#DC2626", text_color="white", font=ctk.CTkFont("Helvetica", 12, "bold"), corner_radius=8, command=self._logout_admin)
         logout_btn.pack(pady=(0, 20))
@@ -1485,6 +1532,10 @@ class BlazeBiteApp(ctk.CTk):
         # Refresh user list
         self._refresh_user_management()
 
+        # Refresh item report combo list
+        if hasattr(self, "report_item_combo"):
+            self._refresh_item_report_items()
+
     # ─────────────────────────────────────────
     #  UTILITIES
     # ─────────────────────────────────────────
@@ -1545,6 +1596,188 @@ class BlazeBiteApp(ctk.CTk):
             cat_items.sort(key=lambda x: x['name'])
 
         return menu
+
+    def _build_item_report_panel(self, parent):
+        """Build the Item Sales Report controls inside the given frame."""
+        inner = ctk.CTkFrame(parent, fg_color="transparent")
+        inner.pack(fill="x", padx=16, pady=14)
+
+        # ── Row 1: period selector + item picker ──
+        row1 = ctk.CTkFrame(inner, fg_color="transparent")
+        row1.pack(fill="x")
+
+        ctk.CTkLabel(row1, text="Period:",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left")
+
+        self.report_period_var = tk.StringVar(value="Daily")
+        for label in ("Daily", "Weekly", "Monthly"):
+            ctk.CTkRadioButton(
+                row1, text=label,
+                variable=self.report_period_var, value=label,
+                fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+                border_color=COLORS["accent_soft"],
+                text_color=COLORS["text_primary"],
+                font=ctk.CTkFont("Helvetica", 12),
+                command=self._refresh_item_report_items,
+            ).pack(side="left", padx=(14, 0))
+
+        ctk.CTkFrame(row1, fg_color=COLORS["border"], width=1, height=28).pack(
+            side="left", padx=18)
+
+        ctk.CTkLabel(row1, text="Item:",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left")
+
+        self.report_item_var = tk.StringVar(value="")
+        self.report_item_combo = ctk.CTkComboBox(
+            row1, variable=self.report_item_var,
+            values=[], width=240, height=34,
+            fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 12),
+        )
+        self.report_item_combo.pack(side="left", padx=(10, 16))
+
+        ctk.CTkButton(
+            row1, text="Generate Report",
+            height=34, width=150, corner_radius=8,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+            text_color="#0A0E27",
+            font=ctk.CTkFont("Helvetica", 12, "bold"),
+            command=self._run_item_report,
+        ).pack(side="left")
+
+        # ── Row 2: results display ──
+        row2 = ctk.CTkFrame(inner, fg_color=COLORS["bg_panel"],
+                             corner_radius=10, border_width=1,
+                             border_color=COLORS["border"])
+        row2.pack(fill="x", pady=(16, 0))
+
+        # Period label
+        self.report_period_lbl = ctk.CTkLabel(
+            row2, text="—  Select a period and item, then click Generate Report",
+            font=ctk.CTkFont("Helvetica", 11),
+            text_color=COLORS["text_muted"],
+        )
+        self.report_period_lbl.pack(anchor="w", padx=16, pady=(12, 0))
+
+        # Metric cards row
+        metrics_row = ctk.CTkFrame(row2, fg_color="transparent")
+        metrics_row.pack(fill="x", padx=12, pady=12)
+
+        def _metric(parent_frame, label, attr):
+            card = ctk.CTkFrame(parent_frame, fg_color=COLORS["bg_card"],
+                                corner_radius=10, border_width=1,
+                                border_color=COLORS["border"])
+            card.pack(side="left", fill="both", expand=True, padx=4)
+            ctk.CTkLabel(card, text=label,
+                         font=ctk.CTkFont("Helvetica", 11),
+                         text_color=COLORS["text_muted"]).pack(pady=(10, 2))
+            val_lbl = ctk.CTkLabel(card, text="—",
+                                   font=ctk.CTkFont("Helvetica", 24, "bold"),
+                                   text_color=COLORS["accent_glow"])
+            val_lbl.pack(pady=(0, 10))
+            setattr(self, attr, val_lbl)
+
+        _metric(metrics_row, "📦  Total Units Sold", "report_qty_lbl")
+        _metric(metrics_row, "💰  Total Revenue",    "report_rev_lbl")
+        _metric(metrics_row, "📅  Period",           "report_range_lbl")
+
+        # Breakdown treeview (per-day/per-week/per-month)
+        breakdown_frame = ctk.CTkFrame(row2, fg_color="transparent")
+        breakdown_frame.pack(fill="x", padx=12, pady=(0, 12))
+
+        br_cols = ("Period", "Units Sold", "Revenue (₵)")
+        self.report_tree = ttk.Treeview(
+            breakdown_frame, columns=br_cols, show="headings",
+            height=6, style="Custom.Treeview",
+        )
+        for col, w in zip(br_cols, [200, 120, 160]):
+            self.report_tree.heading(col, text=col)
+            self.report_tree.column(col, width=w, anchor="center")
+        br_scroll = ttk.Scrollbar(breakdown_frame, orient="vertical",
+                                  command=self.report_tree.yview)
+        self.report_tree.configure(yscrollcommand=br_scroll.set)
+        br_scroll.pack(side="right", fill="y")
+        self.report_tree.pack(fill="x")
+
+    def _refresh_item_report_items(self):
+        """Update the item combo-box list based on what's actually been sold."""
+        names = self.db.get_all_item_names(store=self.active_store)
+        self.report_item_combo.configure(values=names if names else ["(no transactions yet)"])
+        if names and not self.report_item_var.get():
+            self.report_item_var.set(names[0])
+
+    def _run_item_report(self):
+        """Query the DB and populate the report results panel."""
+        item_name = self.report_item_var.get().strip()
+        period    = self.report_period_var.get()
+
+        if not item_name or item_name == "(no transactions yet)":
+            messagebox.showwarning("No Item Selected", "Please select an item from the list.")
+            return
+
+        today      = datetime.date.today()
+        date_slots: list[tuple[str, str, str]] = []  # (slot_label, date_from, date_to)
+
+        if period == "Daily":
+            # Last 30 days, one slot per day
+            for d in range(30):
+                day = today - datetime.timedelta(days=d)
+                label = day.strftime("%Y-%m-%d")
+                date_slots.append((label, label, label))
+
+        elif period == "Weekly":
+            # Last 12 complete weeks + current week
+            for w in range(12):
+                week_start = today - datetime.timedelta(days=today.weekday() + 7 * w)
+                week_end   = week_start + datetime.timedelta(days=6)
+                label = f"Week {week_start.strftime('%d %b')} – {week_end.strftime('%d %b %Y')}"
+                date_slots.append((label, week_start.isoformat(), week_end.isoformat()))
+
+        else:  # Monthly
+            # Last 12 months
+            for m in range(12):
+                year  = today.year
+                month = today.month - m
+                while month <= 0:
+                    month += 12
+                    year  -= 1
+                first = datetime.date(year, month, 1)
+                last_day = (first.replace(month=month % 12 + 1, day=1)
+                            - datetime.timedelta(days=1)) if month < 12 else datetime.date(year, 12, 31)
+                label = first.strftime("%B %Y")
+                date_slots.append((label, first.isoformat(), last_day.isoformat()))
+
+        # Overall range
+        date_from  = date_slots[-1][1]
+        date_to    = date_slots[0][2]
+        total_qty, total_rev = self.db.get_item_report(
+            item_name, date_from, date_to, store=self.active_store
+        )
+
+        # Update metric cards
+        self.report_qty_lbl.configure(text=str(total_qty))
+        self.report_rev_lbl.configure(text=f"₵{total_rev:,.2f}")
+        self.report_range_lbl.configure(
+            text=f"{date_from}  →  {date_to}"
+        )
+        self.report_period_lbl.configure(
+            text=f"  {period} breakdown for  '{item_name}'"
+        )
+
+        # Clear and fill breakdown tree  (skip zero rows)
+        for row in self.report_tree.get_children():
+            self.report_tree.delete(row)
+        for label, d_from, d_to in date_slots:
+            qty, rev = self.db.get_item_report(
+                item_name, d_from, d_to, store=self.active_store
+            )
+            if qty > 0:
+                self.report_tree.insert("", "end", values=(label, qty, f"{rev:,.2f}"))
 
     def _build_product_management(self, parent):
         self.prod_scroll = ctk.CTkScrollableFrame(parent, fg_color=COLORS["bg_dark"], corner_radius=0)
