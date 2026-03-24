@@ -1,0 +1,1 @@
+@"c:/Users/aprek/Desktop/FAST FOOD APP/.venv/Scripts/pythonw.exe" main.py
