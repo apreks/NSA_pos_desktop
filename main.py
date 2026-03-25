@@ -12,6 +12,8 @@ import os
 import json
 import re
 import subprocess
+import ctypes
+from ctypes import wintypes
 from tkinter import messagebox, ttk
 import tkinter as tk
 
@@ -19,7 +21,7 @@ import tkinter as tk
 #  APP SETTINGS
 # ─────────────────────────────────────────────
 APP_NAME = "NSA FAST FOOD"
-TAX_RATE = 0.15
+TAX_RATE = 0.00 # No tax for fast food in this scenario
 DB_FILE = "blazebite.db"
 ADMIN_PASSWORD = "admin123"
 
@@ -1141,16 +1143,78 @@ class BlazeBiteApp(ctk.CTk):
         txt.insert("end", invoice)
         txt.configure(state="disabled")
 
-        def print_invoice():
-            # Save invoice to file and open it for printing
-            fname = f"invoice_{self.order_counter:04d}.txt"
-            with open(fname, "w") as f:
-                f.write(invoice)
+        def get_default_printer_name() -> str | None:
+            """Return the default Windows printer name, or None if unavailable."""
+            if os.name != "nt":
+                return None
+
             try:
-                os.startfile(fname)
-                messagebox.showinfo("Invoice Saved", f"Invoice opened for printing.\nFile saved as '{fname}'\nUse Ctrl+P in the text editor to print.")
+                needed = wintypes.DWORD(0)
+                ctypes.windll.winspool.GetDefaultPrinterW(None, ctypes.byref(needed))
+                if needed.value <= 0:
+                    return None
+
+                buffer = ctypes.create_unicode_buffer(needed.value)
+                if ctypes.windll.winspool.GetDefaultPrinterW(buffer, ctypes.byref(needed)):
+                    name = buffer.value.strip()
+                    return name if name else None
+            except Exception:
+                return None
+
+            return None
+
+        def send_file_to_printer(file_path: str, printer_name: str | None) -> tuple[bool, str]:
+            """Try multiple print mechanisms so printing works across typical Windows setups."""
+            abs_path = os.path.abspath(file_path)
+
+            try:
+                os.startfile(abs_path, "print")
+                return True, "Sent to the default printer."
+            except Exception as first_error:
+                try:
+                    subprocess.run(["notepad.exe", "/p", abs_path], check=True, timeout=20)
+                    return True, "Sent to printer via Notepad fallback."
+                except Exception as second_error:
+                    printer_msg = f" Default printer: {printer_name}." if printer_name else ""
+                    return False, (
+                        f"Could not send the receipt to the printer.{printer_msg}\n"
+                        f"Primary method error: {first_error}\n"
+                        f"Fallback method error: {second_error}"
+                    )
+
+        def print_invoice():
+            # Save invoice to file and send directly to printer.
+            fname = f"invoice_{self.order_counter:04d}.txt"
+            with open(fname, "w", encoding="utf-8") as f:
+                f.write(invoice)
+
+            printer_name = get_default_printer_name()
+            if not printer_name:
+                messagebox.showerror(
+                    "Printer Not Detected",
+                    "No default printer was detected on this system.\n"
+                    "Set a default printer in Windows Settings and try again.\n"
+                    f"Receipt was still saved as '{fname}'."
+                )
+                return
+
+            ok, detail = send_file_to_printer(fname, printer_name)
+            try:
+                if ok:
+                    messagebox.showinfo(
+                        "Print Sent",
+                        f"Receipt sent to printer '{printer_name}'.\n"
+                        f"File saved as '{fname}'.\n{detail}"
+                    )
+                else:
+                    messagebox.showerror(
+                        "Print Failed",
+                        f"Detected printer: '{printer_name}', but printing failed.\n"
+                        f"{detail}\n"
+                        f"Receipt saved as '{fname}'."
+                    )
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to open file: {str(e)}\nFile saved as '{fname}'")
+                messagebox.showerror("Error", f"Unexpected print error: {str(e)}\nFile saved as '{fname}'")
 
         btn_row = ctk.CTkFrame(win, fg_color="transparent")
         btn_row.pack(pady=16)
@@ -1171,23 +1235,33 @@ class BlazeBiteApp(ctk.CTk):
     #  ADMIN VIEW
     # ═══════════════════════════════════════════
     def _build_admin_view(self, parent):
+        # Scroll container so all admin sections remain reachable on any window size.
+        admin_scroll = ctk.CTkScrollableFrame(
+            parent,
+            fg_color=COLORS["bg_dark"],
+            corner_radius=0,
+            scrollbar_button_color=COLORS["border"],
+        )
+        admin_scroll.pack(fill="both", expand=True)
+
         # Top summary cards row
-        self.admin_cards_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_dark"],
+        self.admin_cards_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_dark"],
                                               corner_radius=0, height=110)
         self.admin_cards_frame.pack(fill="x", padx=16, pady=(12, 0))
         self.admin_cards_frame.pack_propagate(False)
 
         # Transaction history
-        hist_lbl = ctk.CTkLabel(parent, text="📋  Transaction History",
+        hist_lbl = ctk.CTkLabel(admin_scroll, text="📋  Transaction History",
                                 font=ctk.CTkFont("Helvetica", 16, "bold"),
                                 text_color=COLORS["text_primary"])
         hist_lbl.pack(anchor="w", padx=20, pady=(16, 8))
 
         # Table
-        table_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"],
+        table_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
                                    corner_radius=14, border_width=1,
-                                   border_color=COLORS["border"])
-        table_frame.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+                                   border_color=COLORS["border"], height=260)
+        table_frame.pack(fill="x", padx=16, pady=(0, 12))
+        table_frame.pack_propagate(False)
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -1224,42 +1298,44 @@ class BlazeBiteApp(ctk.CTk):
         self.tree.pack(fill="both", expand=True, padx=4, pady=4)
 
         # Product management
-        prod_lbl = ctk.CTkLabel(parent, text="🛠️  Product Management",
+        prod_lbl = ctk.CTkLabel(admin_scroll, text="🛠️  Product Management",
                                 font=ctk.CTkFont("Helvetica", 16, "bold"),
                                 text_color=COLORS["text_primary"])
         prod_lbl.pack(anchor="w", padx=20, pady=(16, 8))
 
-        prod_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"],
-                                  corner_radius=10)
-        prod_frame.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        prod_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                      corner_radius=10, height=260)
+        prod_frame.pack(fill="x", padx=16, pady=(0, 12))
+        prod_frame.pack_propagate(False)
 
         self._build_product_management(prod_frame)
 
         # User management (credentials)
-        user_lbl = ctk.CTkLabel(parent, text="🔑  User Accounts",
+        user_lbl = ctk.CTkLabel(admin_scroll, text="🔑  User Accounts",
                                 font=ctk.CTkFont("Helvetica", 16, "bold"),
                                 text_color=COLORS["text_primary"])
         user_lbl.pack(anchor="w", padx=20, pady=(16, 8))
 
-        user_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"],
-                                  corner_radius=10)
-        user_frame.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        user_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                      corner_radius=10, height=210)
+        user_frame.pack(fill="x", padx=16, pady=(0, 12))
+        user_frame.pack_propagate(False)
 
         self._build_user_management(user_frame)
 
         # ── Item Sales Report ──
-        ctk.CTkLabel(parent, text="📈  Item Sales Report",
+        ctk.CTkLabel(admin_scroll, text="📈  Item Sales Report",
                      font=ctk.CTkFont("Helvetica", 16, "bold"),
                      text_color=COLORS["text_primary"]).pack(anchor="w", padx=20, pady=(16, 8))
 
-        report_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"],
+        report_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
                                     corner_radius=10, border_width=1,
                                     border_color=COLORS["border"])
         report_frame.pack(fill="x", padx=16, pady=(0, 12))
         self._build_item_report_panel(report_frame)
 
         # Logout button
-        logout_btn = ctk.CTkButton(parent, text="🚪 Logout Admin", height=40, fg_color=COLORS["error"], hover_color="#DC2626", text_color="white", font=ctk.CTkFont("Helvetica", 12, "bold"), corner_radius=8, command=self._logout_admin)
+        logout_btn = ctk.CTkButton(admin_scroll, text="🚪 Logout Admin", height=40, fg_color=COLORS["error"], hover_color="#DC2626", text_color="white", font=ctk.CTkFont("Helvetica", 12, "bold"), corner_radius=8, command=self._logout_admin)
         logout_btn.pack(pady=(0, 20))
 
     def _build_root_admin_view(self, parent):
