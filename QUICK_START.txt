@@ -1,0 +1,147 @@
+================================================================================
+                   QUICK START GUIDE - NSA FAST FOOD POS
+================================================================================
+
+YOUR DELIVERABLES
+═════════════════════════════════════════════════════════════════════════════
+
+✓ FastFoodPOS-Installer-v1.0.zip (12.71 MB)
+  → Main distribution file for sharing with others
+  → Contains everything needed for installation
+
+✓ FastFoodPOS-Installer-v1.0 (folder)
+  → Uncompressed installer package
+  → Use setup.bat to install
+
+✓ dist/FastFoodPOS/FastFoodPOS.exe (2.51 MB)
+  → Standalone executable (no installation required)
+  → Run directly if preferred
+
+✓ README.txt
+  → Detailed installation and troubleshooting guide
+  → Located in FastFoodPOS-Installer-v1.0 folder
+
+═════════════════════════════════════════════════════════════════════════════
+THREE WAYS TO USE YOUR EXE
+═════════════════════════════════════════════════════════════════════════════
+
+METHOD 1: RUN STANDALONE (No Installation)
+─────────────────────────────────────────────
+Steps:
+  1. Navigate to: FastFoodPOS-Installer-v1.0\FastFoodPOS
+  2. Double-click: FastFoodPOS.exe
+  3. App launches immediately
+  → Best for: Quick testing, portable use
+
+METHOD 2: INSTALL WITH SETUP SCRIPT
+─────────────────────────────────────────────
+Steps:
+  1. Open: FastFoodPOS-Installer-v1.0 folder
+  2. Double-click: setup.bat
+  3. Wait for completion (takes ~1 minute)
+  4. Find app in Start Menu > NSAFastFood > NSA Fast Food POS
+  → Best for: Production use, professional setup
+  → Installs to: C:\Program Files\NSAFastFood
+
+METHOD 3: SHARE WITH OTHERS
+─────────────────────────────────────────────
+Steps:
+  1. Send: FastFoodPOS-Installer-v1.0.zip file
+  2. Recipient extracts ZIP
+  3. Recipient runs: setup.bat
+  4. Recipe runs and installs automatically
+  → Best for: Distribution to team/customers
+  → 12.71 MB file size
+
+═════════════════════════════════════════════════════════════════════════════
+APPLICATION DATA LOCATIONS
+═════════════════════════════════════════════════════════════════════════════
+
+Database:
+  → C:\Users\[YourUsername]\AppData\Roaming\NSAFastFood\blazebite.db
+
+Invoices:
+  → C:\Users\[YourUsername]\AppData\Roaming\NSAFastFood\invoice_1001.txt
+  → C:\Users\[YourUsername]\AppData\Roaming\NSAFastFood\invoice_1002.txt
+  → etc.
+
+Installation (if using setup.bat):
+  → C:\Program Files\NSAFastFood
+
+═════════════════════════════════════════════════════════════════════════════
+UNINSTALLING
+═════════════════════════════════════════════════════════════════════════════
+
+If you installed with setup.bat:
+  → Run uninstall.bat from the FastFoodPOS-Installer-v1.0 folder
+  → OR find in Windows Settings > Apps > Uninstall Apps > NSA Fast Food POS
+
+If you ran standalone:
+  → Just delete the FastFoodPOS-Installer-v1.0 folder (no installation)
+
+═════════════════════════════════════════════════════════════════════════════
+TROUBLESHOOTING
+═════════════════════════════════════════════════════════════════════════════
+
+Problem: "Windows protected your PC" warning
+Solution: Click "More info" > "Run anyway" (this is normal for new executables)
+
+Problem: Application won't start
+Solution: Try running as Administrator
+          → Right-click FastFoodPOS.exe > Run as administrator
+
+Problem: setup.bat gives "Access Denied"
+Solution: Run Command Prompt as Administrator
+          → Right-click Start > Windows Terminal (Admin)
+          → Navigate to folder and run: setup.bat
+
+Problem: Can't find installed application
+Solution: Check Start Menu > type "NSA Fast Food"
+          or look for desktop shortcut
+
+═════════════════════════════════════════════════════════════════════════════
+SHARING INSTRUCTIONS FOR OTHERS
+═════════════════════════════════════════════════════════════════════════════
+
+Send them this file: FastFoodPOS-Installer-v1.0.zip
+
+They can extract and follow these steps:
+  1. Extract FastFoodPOS-Installer-v1.0.zip
+  2. Open FastFoodPOS-Installer-v1.0 folder
+  3. Double-click setup.bat
+  4. Wait for "Installation Complete!" message
+  5. Find app in Start Menu or Desktop
+
+═════════════════════════════════════════════════════════════════════════════
+WHAT'S INCLUDED
+═════════════════════════════════════════════════════════════════════════════
+
+✓ FastFoodPOS.exe (2.51 MB app)
+✓ All dependencies (DLLs, Python runtime, etc.)
+✓ Customized Tkinter UI framework
+✓ SQLite3 database engine
+✓ Pre-configured for Windows 7/10/11
+
+NO LONGER NEEDED:
+✗ Python installation
+✗ Virtual environment
+✗ pip or dependency management
+✗ Administrator rights (for most users)
+
+═════════════════════════════════════════════════════════════════════════════
+FINAL CHECKLIST
+═════════════════════════════════════════════════════════════════════════════
+
+Before distribution, verify:
+  ✓ FastFoodPOS-Installer-v1.0.zip exists (12.71 MB)
+  ✓ FastFoodPOS.exe launches and opens
+  ✓ Database created in APPDATA on first run
+  ✓ setup.bat installs successfully
+  ✓ Uninstall works properly
+  ✓ App creates invoices in APPDATA
+
+You're ready to share with others!
+
+═════════════════════════════════════════════════════════════════════════════
+For detailed help, see: README.txt in FastFoodPOS-Installer-v1.0 folder
+================================================================================

@@ -18,11 +18,21 @@ from tkinter import messagebox, ttk
 import tkinter as tk
 
 # ─────────────────────────────────────────────
+#  APP DATA DIRECTORY SETUP
+# ─────────────────────────────────────────────
+def get_app_data_dir():
+    """Get or create the application data directory in user's APPDATA."""
+    app_data_path = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'NSAFastFood')
+    if not os.path.exists(app_data_path):
+        os.makedirs(app_data_path, exist_ok=True)
+    return app_data_path
+
+# ─────────────────────────────────────────────
 #  APP SETTINGS
 # ─────────────────────────────────────────────
 APP_NAME = "NSA FAST FOOD"
 TAX_RATE = 0.00 # No tax for fast food in this scenario
-DB_FILE = "blazebite.db"
+DB_FILE = os.path.join(get_app_data_dir(), "blazebite.db")
 ADMIN_PASSWORD = "admin123"
 
 # ─────────────────────────────────────────────
@@ -952,6 +962,53 @@ class BlazeBiteApp(ctk.CTk):
                 font=ctk.CTkFont("Helvetica", 12),
             ).pack(side="left", padx=18, pady=12)
 
+        # Cash tendered and change
+        cash_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"], corner_radius=0,
+                                  border_width=1, border_color=COLORS["border"])
+        cash_frame.pack(fill="x", padx=0, pady=(1, 0))
+
+        ctk.CTkLabel(cash_frame, text="Cash Tendered (₵):",
+                     font=ctk.CTkFont("Helvetica", 13, "bold"),
+                     text_color=COLORS["text_primary"]).pack(side="left", padx=(18, 10), pady=12)
+
+        self.cash_tendered_var = ctk.StringVar(value="")
+        self.cash_entry = ctk.CTkEntry(
+            cash_frame,
+            textvariable=self.cash_tendered_var,
+            width=140,
+            height=34,
+            fg_color=COLORS["bg_card"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            placeholder_text="0.00",
+        )
+        self.cash_entry.pack(side="left", padx=(0, 12), pady=10)
+        self.cash_entry.bind("<KeyRelease>", lambda _event: self._update_change_display())
+        self.cash_entry.bind("<FocusOut>", lambda _event: self._update_change_display())
+
+        ctk.CTkButton(
+            cash_frame,
+            text="Calculate",
+            width=100,
+            height=34,
+            corner_radius=8,
+            fg_color=COLORS["accent_soft"],
+            hover_color=COLORS["accent"],
+            text_color="#0A0E27",
+            font=ctk.CTkFont("Helvetica", 12, "bold"),
+            command=self._update_change_display,
+        ).pack(side="left", padx=(0, 12), pady=10)
+
+        self.change_lbl = ctk.CTkLabel(
+            cash_frame,
+            text="Change: enter valid cash amount",
+            font=ctk.CTkFont("Helvetica", 12, "bold"),
+            text_color=COLORS["warning"],
+        )
+        self.change_lbl.pack(side="left", padx=(0, 12), pady=10)
+
+        self.payment_var.trace_add("write", lambda *_args: self._update_payment_fields())
+
         # Checkout button
         ctk.CTkButton(
             parent, text="💳  PROCESS PAYMENT",
@@ -1013,6 +1070,59 @@ class BlazeBiteApp(ctk.CTk):
         self.sub_lbl.configure(text=f"₵{subtotal:.2f}")
         self.tax_lbl.configure(text=f"₵{tax:.2f}")
         self.total_lbl.configure(text=f"₵{total:.2f}")
+        self._update_change_display()
+
+    def _parse_cash_tendered(self):
+        raw_cash = self.cash_tendered_var.get().strip().replace("₵", "").replace(",", "")
+        if not raw_cash:
+            return None
+        try:
+            value = float(raw_cash)
+        except ValueError:
+            return None
+        if value < 0:
+            return None
+        return value
+
+    def _update_payment_fields(self):
+        is_cash = self.payment_var.get() == "Cash"
+        self.cash_entry.configure(state="normal" if is_cash else "disabled")
+        if not is_cash:
+            self.change_lbl.configure(
+                text="Change: N/A (non-cash)",
+                text_color=COLORS["text_muted"],
+            )
+            return
+        self._update_change_display()
+
+    def _update_change_display(self):
+        if self.payment_var.get() != "Cash":
+            self.change_lbl.configure(text="Change: N/A (non-cash)", text_color=COLORS["text_muted"])
+            return
+
+        subtotal = sum(d["price"] * d["qty"] for d in self.order_items.values())
+        tax = subtotal * TAX_RATE
+        total = subtotal + tax
+        cash_tendered = self._parse_cash_tendered()
+
+        if cash_tendered is None:
+            self.change_lbl.configure(
+                text="Change: enter valid cash amount",
+                text_color=COLORS["warning"],
+            )
+            return
+
+        change = cash_tendered - total
+        if change < 0:
+            self.change_lbl.configure(
+                text=f"Insufficient: need ₵{abs(change):.2f} more",
+                text_color=COLORS["error"],
+            )
+        else:
+            self.change_lbl.configure(
+                text=f"Change: ₵{change:.2f}",
+                text_color=COLORS["success"],
+            )
 
     def _make_order_row(self, name: str, data: dict):
         row = ctk.CTkFrame(self.order_scroll, fg_color=COLORS["bg_card"],
@@ -1064,6 +1174,26 @@ class BlazeBiteApp(ctk.CTk):
         tax      = subtotal * TAX_RATE
         total    = subtotal + tax
         payment  = self.payment_var.get()
+        cash_tendered = None
+        change = None
+
+        if payment == "Cash":
+            cash_tendered = self._parse_cash_tendered()
+            if cash_tendered is None:
+                messagebox.showwarning("Invalid Cash Amount", "Please enter a valid cash amount tendered.")
+                return
+
+            change = round(cash_tendered - total, 2)
+            if change < 0:
+                messagebox.showerror(
+                    "Insufficient Funds",
+                    f"Cash tendered is not enough.\n"
+                    f"Total: ₵{total:.2f}\n"
+                    f"Tendered: ₵{cash_tendered:.2f}\n"
+                    f"Need: ₵{abs(change):.2f} more",
+                )
+                return
+
         items_list = [{"name": n, "price": d["price"], "qty": d["qty"]}
                       for n, d in self.order_items.items()]
 
@@ -1075,12 +1205,12 @@ class BlazeBiteApp(ctk.CTk):
             self.current_role or "unknown",
             "CHECKOUT",
             f"order#{self.order_counter:04d}",
-            f"total={total:.2f}, payment={payment}",
+            f"total={total:.2f}, payment={payment}, cash={cash_tendered if cash_tendered is not None else 'N/A'}, change={change if change is not None else 'N/A'}",
             store=self.active_store or "system",
         )
 
         # Generate invoice
-        invoice = self._build_invoice(items_list, subtotal, tax, total, payment)
+        invoice = self._build_invoice(items_list, subtotal, tax, total, payment, cash_tendered, change)
 
         # Show invoice window
         self._show_invoice_window(invoice)
@@ -1090,7 +1220,7 @@ class BlazeBiteApp(ctk.CTk):
         self.order_counter += 1
         self.order_badge.configure(text=f"Order  # {self.order_counter:04d}")
 
-    def _build_invoice(self, items, subtotal, tax, total, payment):
+    def _build_invoice(self, items, subtotal, tax, total, payment, cash_tendered=None, change=None):
         now = datetime.datetime.now()
         lines = [
             "=" * 44,
@@ -1122,6 +1252,11 @@ class BlazeBiteApp(ctk.CTk):
             "  Thank You For Your Patronage. See You Soon!.",
             "=" * 44,
         ]
+
+        if payment == "Cash" and cash_tendered is not None and change is not None:
+            lines.insert(-4, f"  {'Cash Tendered':<30}  ₵{cash_tendered:>7.2f}")
+            lines.insert(-4, f"  {'Change':<30}  ₵{change:>7.2f}")
+
         return "\n".join(lines)
 
     def _show_invoice_window(self, invoice: str):
@@ -1184,7 +1319,8 @@ class BlazeBiteApp(ctk.CTk):
 
         def print_invoice():
             # Save invoice to file and send directly to printer.
-            fname = f"invoice_{self.order_counter:04d}.txt"
+            app_data_dir = get_app_data_dir()
+            fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
             with open(fname, "w", encoding="utf-8") as f:
                 f.write(invoice)
 
