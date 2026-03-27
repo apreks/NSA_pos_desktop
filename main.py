@@ -33,6 +33,7 @@ def get_app_data_dir():
 APP_NAME = "NSA FAST FOOD"
 TAX_RATE = 0.00 # No tax for fast food in this scenario
 DB_FILE = os.path.join(get_app_data_dir(), "blazebite.db")
+SETTINGS_FILE = os.path.join(get_app_data_dir(), "settings.json")
 ADMIN_PASSWORD = "admin123"
 
 # ─────────────────────────────────────────────
@@ -158,7 +159,8 @@ class Database:
                 category TEXT    NOT NULL,
                 name     TEXT    NOT NULL,
                 price    REAL    NOT NULL,
-                desc     TEXT
+                desc     TEXT,
+                quantity INTEGER DEFAULT 0
             )
         """)
         self.conn.execute("""
@@ -187,6 +189,7 @@ class Database:
         # Ensure schema has store information for filtering by POS
         self._ensure_column("transactions", "store", "TEXT", default="fast_food")
         self._ensure_column("products", "store", "TEXT", default="fast_food")
+        self._ensure_column("products", "quantity", "INTEGER", default=0)
         self._ensure_column("users", "disabled", "INTEGER", default=0)
 
     def _has_column(self, table: str, column: str) -> bool:
@@ -234,6 +237,21 @@ class Database:
             )
         else:
             cur = self.conn.execute("SELECT * FROM transactions ORDER BY id DESC")
+        return cur.fetchall()
+
+    def get_transactions_by_date_range(self, date_from: str, date_to: str,
+                                       store: str | None = None):
+        """Return transactions whose date falls within [date_from, date_to] (ISO strings)."""
+        if store:
+            cur = self.conn.execute(
+                "SELECT * FROM transactions WHERE date >= ? AND date <= ? AND store = ? ORDER BY id DESC",
+                (date_from, date_to, store),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT * FROM transactions WHERE date >= ? AND date <= ? ORDER BY id DESC",
+                (date_from, date_to),
+            )
         return cur.fetchall()
 
     def get_today_summary(self, store: str | None = None):
@@ -299,17 +317,17 @@ class Database:
             cur = self.conn.execute("SELECT * FROM products ORDER BY store, category, name")
         return cur.fetchall()
 
-    def add_product(self, category, name, price, desc, store: str = "fast_food"):
+    def add_product(self, category, name, price, desc, quantity: int = 0, store: str = "fast_food"):
         self.conn.execute(
-            "INSERT INTO products (category, name, price, desc, store) VALUES (?, ?, ?, ?, ?)",
-            (category, name, price, desc, store),
+            "INSERT INTO products (category, name, price, desc, quantity, store) VALUES (?, ?, ?, ?, ?, ?)",
+            (category, name, price, desc, quantity, store),
         )
         self.conn.commit()
 
-    def update_product(self, id, category, name, price, desc, store: str = "fast_food"):
+    def update_product(self, id, category, name, price, desc, quantity: int = 0, store: str = "fast_food"):
         self.conn.execute(
-            "UPDATE products SET category=?, name=?, price=?, desc=?, store=? WHERE id=?",
-            (category, name, price, desc, store, id),
+            "UPDATE products SET category=?, name=?, price=?, desc=?, quantity=?, store=? WHERE id=?",
+            (category, name, price, desc, quantity, store, id),
         )
         self.conn.commit()
 
@@ -484,6 +502,168 @@ class Database:
         self.add_or_update_user("system", "root_admin", "root_admin", "root123", create_if_missing=True)
 
 
+
+# ══════════════════════════════════════════════════════════════════
+#  DATE PICKER POPUP  (pure CTk / tkinter – no extra library needed)
+# ══════════════════════════════════════════════════════════════════
+class DatePickerPopup(ctk.CTkToplevel):
+    """A lightweight calendar popup that returns a selected date as YYYY-MM-DD."""
+
+    _DAY_ABBRS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+
+    def __init__(self, parent, callback, initial_date=None):
+        super().__init__(parent)
+        self._callback = callback
+
+        # Start from today or supplied date
+        if initial_date:
+            try:
+                d = datetime.date.fromisoformat(initial_date)
+            except ValueError:
+                d = datetime.date.today()
+        else:
+            d = datetime.date.today()
+
+        self._year  = d.year
+        self._month = d.month
+        self._sel   = d                # currently highlighted date
+
+        self.title("Select Date")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.configure(fg_color=COLORS["bg_dark"])
+        self.geometry("310x290")
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"310x290+{pw - 155}+{ph - 145}")
+
+        self._build()
+        self.focus_force()
+
+    # ── Layout ──────────────────────────────────────────────────
+    def _build(self):
+        # Navigation row
+        nav = ctk.CTkFrame(self, fg_color="transparent")
+        nav.pack(fill="x", padx=10, pady=(12, 6))
+
+        ctk.CTkButton(nav, text="◀", width=32, height=30, corner_radius=6,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      font=ctk.CTkFont("Helvetica", 13, "bold"),
+                      command=self._prev_month).pack(side="left")
+
+        self._month_lbl = ctk.CTkLabel(nav, text="",
+                                        font=ctk.CTkFont("Helvetica", 13, "bold"),
+                                        text_color=COLORS["text_primary"])
+        self._month_lbl.pack(side="left", expand=True)
+
+        ctk.CTkButton(nav, text="▶", width=32, height=30, corner_radius=6,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      font=ctk.CTkFont("Helvetica", 13, "bold"),
+                      command=self._next_month).pack(side="right")
+
+        # Day-of-week headers
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", padx=10)
+        for abbr in self._DAY_ABBRS:
+            ctk.CTkLabel(hdr, text=abbr, width=38, height=24,
+                         font=ctk.CTkFont("Helvetica", 10, "bold"),
+                         text_color=COLORS["text_muted"]).pack(side="left")
+
+        # Day grid container
+        self._grid_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self._grid_frame.pack(fill="both", expand=True, padx=10, pady=(2, 8))
+
+        # Today button
+        ctk.CTkButton(self, text="Today", height=30, corner_radius=6,
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+                      text_color="white", font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._select_today).pack(fill="x", padx=10, pady=(0, 10))
+
+        self._draw_grid()
+
+    def _draw_grid(self):
+        for w in self._grid_frame.winfo_children():
+            w.destroy()
+
+        self._month_lbl.configure(
+            text=datetime.date(self._year, self._month, 1).strftime("%B  %Y")
+        )
+
+        import calendar
+        first_wd, days_in_month = calendar.monthrange(self._year, self._month)
+        today = datetime.date.today()
+
+        col = first_wd  # 0=Mon … 6=Sun
+        # Fill blank cells before the 1st
+        for _ in range(first_wd):
+            ctk.CTkLabel(self._grid_frame, text="", width=38, height=32).grid(
+                row=0, column=_)
+
+        row = 0
+        for day in range(1, days_in_month + 1):
+            d = datetime.date(self._year, self._month, day)
+            is_today = (d == today)
+            is_sel   = (d == self._sel)
+
+            if is_sel:
+                fg   = COLORS["accent"]
+                htxt = COLORS["text_primary"]
+            elif is_today:
+                fg   = COLORS["success"]
+                htxt = "white"
+            else:
+                fg   = COLORS["bg_hover"]
+                htxt = COLORS["text_primary"]
+
+            btn = ctk.CTkButton(
+                self._grid_frame, text=str(day),
+                width=38, height=32, corner_radius=6,
+                fg_color=fg,
+                hover_color=COLORS["accent_glow"],
+                text_color=htxt,
+                font=ctk.CTkFont("Helvetica", 11),
+                command=lambda d=d: self._pick(d),
+            )
+            btn.grid(row=row, column=col, padx=1, pady=1)
+            col += 1
+            if col == 7:
+                col = 0
+                row += 1
+
+    def _prev_month(self):
+        if self._month == 1:
+            self._month = 12
+            self._year -= 1
+        else:
+            self._month -= 1
+        self._draw_grid()
+
+    def _next_month(self):
+        if self._month == 12:
+            self._month = 1
+            self._year += 1
+        else:
+            self._month += 1
+        self._draw_grid()
+
+    def _pick(self, date: datetime.date):
+        self._sel = date
+        self._draw_grid()
+        self.after(120, lambda: [self._callback(date.isoformat()), self.destroy()])
+
+    def _select_today(self):
+        today = datetime.date.today()
+        self._year  = today.year
+        self._month = today.month
+        self._sel   = today
+        self._draw_grid()
+        self.after(120, lambda: [self._callback(today.isoformat()), self.destroy()])
+
+
 # ══════════════════════════════════════════════════════════════════
 #  MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════
@@ -515,6 +695,8 @@ class BlazeBiteApp(ctk.CTk):
         self.order_items: dict[str, dict] = {}   # name -> {price, qty, desc}
         self.order_counter = 1001
         self.active_category = None
+        self.receipt_paper_profile = "Auto"  # Auto | 80mm | 58mm
+        self._load_app_settings()
 
         # ── Build UI ──
         self._build_layout()
@@ -525,6 +707,45 @@ class BlazeBiteApp(ctk.CTk):
     # ─────────────────────────────────────────
     #  LAYOUT SKELETON
     # ─────────────────────────────────────────
+    def _load_app_settings(self):
+        """Load persisted app settings from disk."""
+        try:
+            if not os.path.exists(SETTINGS_FILE):
+                return
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            profile = str(data.get("receipt_paper_profile", "Auto")).strip()
+            if profile in ("Auto", "80mm", "58mm"):
+                self.receipt_paper_profile = profile
+        except Exception:
+            # Keep defaults when settings are missing/corrupt.
+            self.receipt_paper_profile = "Auto"
+
+    def _save_app_settings(self):
+        """Persist app settings to disk."""
+        try:
+            data = {
+                "receipt_paper_profile": self.receipt_paper_profile,
+            }
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def _on_receipt_profile_changed(self, value: str | None = None):
+        selected = (value or "").strip()
+        if selected not in ("Auto", "80mm", "58mm"):
+            selected = "Auto"
+
+        self.receipt_paper_profile = selected
+
+        if hasattr(self, "admin_receipt_profile_var") and self.admin_receipt_profile_var.get() != selected:
+            self.admin_receipt_profile_var.set(selected)
+        if hasattr(self, "root_receipt_profile_var") and self.root_receipt_profile_var.get() != selected:
+            self.root_receipt_profile_var.set(selected)
+
+        self._save_app_settings()
+
     def _build_layout(self):
         # Top bar
         self._build_topbar()
@@ -742,6 +963,49 @@ class BlazeBiteApp(ctk.CTk):
 
     # ── Category tabs ──
     def _build_menu_panel(self, parent):
+        # Search frame
+        search_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"],
+                                   corner_radius=0, height=56, border_width=1,
+                                   border_color=COLORS["border"])
+        search_frame.pack(fill="x")
+        search_frame.pack_propagate(False)
+
+        # Search entry
+        search_label = ctk.CTkLabel(search_frame, text="🔍 Search:",
+                                   font=ctk.CTkFont("Helvetica", 11),
+                                   text_color=COLORS["text_secondary"])
+        search_label.pack(side="left", padx=10, pady=8)
+
+        self.search_var = ctk.StringVar()
+        self.search_entry = ctk.CTkEntry(search_frame, textvariable=self.search_var,
+                                         width=200, height=36, corner_radius=8,
+                                         fg_color=COLORS["bg_hover"],
+                                         border_color=COLORS["border"],
+                                         placeholder_text="Search items...",
+                                         font=ctk.CTkFont("Helvetica", 11))
+        self.search_entry.pack(side="left", padx=5, pady=8)
+        self.search_entry.bind("<Return>", lambda _: self._perform_search())
+
+        # Search button
+        search_btn = ctk.CTkButton(search_frame, text="Search",
+                                  width=80, height=36, corner_radius=8,
+                                  fg_color=COLORS["success"],
+                                  hover_color="#059669",
+                                  text_color="white",
+                                  font=ctk.CTkFont("Helvetica", 11, "bold"),
+                                  command=self._perform_search)
+        search_btn.pack(side="left", padx=5, pady=8)
+
+        # Clear search button
+        clear_btn = ctk.CTkButton(search_frame, text="Clear",
+                                 width=70, height=36, corner_radius=8,
+                                 fg_color=COLORS["bg_hover"],
+                                 hover_color=COLORS["border"],
+                                 text_color=COLORS["text_secondary"],
+                                 font=ctk.CTkFont("Helvetica", 11),
+                                 command=self._clear_search)
+        clear_btn.pack(side="left", padx=2, pady=8)
+
         # Category tab bar
         self.cat_bar = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"],
                                corner_radius=0, height=56, border_width=1,
@@ -751,6 +1015,8 @@ class BlazeBiteApp(ctk.CTk):
 
         self.cat_buttons = {}
         self.category_frames = {}  # Cache frames per category for responsiveness
+        self.search_active = False  # Track if we're viewing search results
+        self.search_results = []  # Store search results
         self._refresh_category_buttons()
 
         # Scrollable item grid
@@ -781,6 +1047,11 @@ class BlazeBiteApp(ctk.CTk):
     def _select_category(self, cat: str):
         if cat is None or cat == self.active_category:
             return
+        # Clear search when selecting a category
+        self.search_var.set("")
+        self.search_active = False
+        self.search_results = []
+
         self.active_category = cat
         for c, btn in self.cat_buttons.items():
             if c == cat:
@@ -831,6 +1102,64 @@ class BlazeBiteApp(ctk.CTk):
         for i, item in enumerate(items):
             row, col = divmod(i, cols)
             self._make_item_card(self.menu_scroll, item, row, col)
+
+    def _perform_search(self):
+        """Search for items across all categories by name or description."""
+        query = self.search_var.get().strip().lower()
+        if not query:
+            return
+
+        # Clear old widgets
+        for widget in self.menu_scroll.winfo_children():
+            widget.destroy()
+
+        # Search through all items in all categories
+        self.search_results = []
+        for category, items in self.menu_data.items():
+            for item in items:
+                item_name = item["name"].lower()
+                item_desc = item.get("desc", "").lower()
+                if query in item_name or query in item_desc:
+                    self.search_results.append(item)
+
+        self.search_active = True
+        self._render_search_results()
+
+    def _render_search_results(self):
+        """Display the search results in the menu scroll area."""
+        # Clear old widgets
+        for widget in self.menu_scroll.winfo_children():
+            widget.destroy()
+
+        if not self.search_results:
+            no_results_label = ctk.CTkLabel(
+                self.menu_scroll,
+                text="No items found.\nTry a different search term.",
+                text_color=COLORS["text_muted"],
+                font=ctk.CTkFont("Helvetica", 13)
+            )
+            no_results_label.pack(pady=40)
+            return
+
+        # Display search results in grid (3 columns)
+        cols = 3
+        for i, item in enumerate(self.search_results):
+            row, col = divmod(i, cols)
+            self._make_item_card(self.menu_scroll, item, row, col)
+
+    def _clear_search(self):
+        """Clear the search and return to category view."""
+        self.search_var.set("")
+        self.search_active = False
+        self.search_results = []
+
+        # Clear menu scroll
+        for widget in self.menu_scroll.winfo_children():
+            widget.destroy()
+
+        # Show the active category
+        if self.active_category:
+            self._render_category(self.active_category)
 
     def _make_item_card(self, parent, item: dict, row: int, col: int):
         # Use grid layout for better performance than pack
@@ -1220,46 +1549,174 @@ class BlazeBiteApp(ctk.CTk):
         self.order_counter += 1
         self.order_badge.configure(text=f"Order  # {self.order_counter:04d}")
 
-    def _build_invoice(self, items, subtotal, tax, total, payment, cash_tendered=None, change=None):
+    def _get_default_printer_name(self) -> str | None:
+        """Return the default Windows printer name, or None if unavailable."""
+        if os.name != "nt":
+            return None
+
+        try:
+            needed = wintypes.DWORD(0)
+            ctypes.windll.winspool.GetDefaultPrinterW(None, ctypes.byref(needed))
+            if needed.value <= 0:
+                return None
+
+            buffer = ctypes.create_unicode_buffer(needed.value)
+            if ctypes.windll.winspool.GetDefaultPrinterW(buffer, ctypes.byref(needed)):
+                name = buffer.value.strip()
+                return name if name else None
+        except Exception:
+            return None
+
+        return None
+
+    def _get_receipt_profile(self, printer_name: str | None = None) -> dict:
+        """Choose receipt layout based on printer model/paper size hints."""
+        forced_profile = getattr(self, "receipt_paper_profile", "Auto")
+        if forced_profile == "80mm":
+            return {"paper": "80mm", "line_width": 42, "qty_w": 3, "amt_w": 10}
+        if forced_profile == "58mm":
+            return {"paper": "58mm", "line_width": 32, "qty_w": 3, "amt_w": 9}
+
+        name = (printer_name or "").lower()
+
+        # Epson TM-T20II is typically an 80mm receipt printer.
+        if "tm-t20ii" in name or ("epson" in name and "tm-t20" in name):
+            return {"paper": "80mm", "line_width": 42, "qty_w": 3, "amt_w": 10}
+
+        # Common 58mm thermal printers
+        if any(token in name for token in ("58mm", "58 mm", "pos-58", "xp-58", "tm-p20")):
+            return {"paper": "58mm", "line_width": 32, "qty_w": 3, "amt_w": 9}
+
+        # Safe default for most POS thermal setups
+        return {"paper": "80mm", "line_width": 42, "qty_w": 3, "amt_w": 10}
+
+    def _center_receipt_text(self, text: str, width: int) -> str:
+        text = (text or "").strip()
+        if len(text) >= width:
+            return text[:width]
+        return text.center(width)
+
+    def _send_raw_to_printer(self, printer_name: str, text_payload: str) -> tuple[bool, str]:
+        """Send text directly to the Windows spooler as RAW data."""
+        if os.name != "nt":
+            return False, "Raw printing is only supported on Windows."
+
+        try:
+            winspool = ctypes.windll.winspool
+
+            class DOCINFO1(ctypes.Structure):
+                _fields_ = [
+                    ("pDocName", wintypes.LPWSTR),
+                    ("pOutputFile", wintypes.LPWSTR),
+                    ("pDatatype", wintypes.LPWSTR),
+                ]
+
+            h_printer = wintypes.HANDLE()
+            if not winspool.OpenPrinterW(printer_name, ctypes.byref(h_printer), None):
+                raise OSError("OpenPrinterW failed")
+
+            try:
+                doc_info = DOCINFO1("Receipt", None, "RAW")
+                if winspool.StartDocPrinterW(h_printer, 1, ctypes.byref(doc_info)) == 0:
+                    raise OSError("StartDocPrinterW failed")
+
+                try:
+                    if not winspool.StartPagePrinter(h_printer):
+                        raise OSError("StartPagePrinter failed")
+
+                    payload = text_payload.encode("ascii", errors="replace")
+                    written = wintypes.DWORD(0)
+                    ok = winspool.WritePrinter(
+                        h_printer,
+                        payload,
+                        len(payload),
+                        ctypes.byref(written),
+                    )
+                    if not ok or written.value != len(payload):
+                        raise OSError("WritePrinter failed")
+
+                    if not winspool.EndPagePrinter(h_printer):
+                        raise OSError("EndPagePrinter failed")
+                finally:
+                    winspool.EndDocPrinter(h_printer)
+            finally:
+                winspool.ClosePrinter(h_printer)
+
+            return True, "Sent to printer via RAW spooler."
+        except Exception as e:
+            return False, str(e)
+
+    def _build_invoice(self, items, subtotal, tax, total, payment, cash_tendered=None, change=None, printer_name: str | None = None):
+        printer_name = printer_name or self._get_default_printer_name()
+        profile = self._get_receipt_profile(printer_name)
+        width = profile["line_width"]
+        qty_w = profile["qty_w"]
+        amt_w = profile["amt_w"]
+        name_w = max(8, width - qty_w - amt_w - 2)
+
         now = datetime.datetime.now()
+
+        def _row(name: str, qty: int | str, amount: str):
+            name_txt = (name or "")[:name_w]
+            qty_txt = str(qty)
+            return f"{name_txt:<{name_w}} {qty_txt:>{qty_w}} {amount:>{amt_w}}"
+
+        tax_pct = TAX_RATE * 100
+        sep = "=" * width
+        mid = "-" * width
+
         lines = [
-            "=" * 44,
-            f"        {APP_NAME}  Restaurant",
-            "    46 Patrice Lumumba Road, Airport Residential Area",
-            "    P.O. Box 46, State House - Accra",
-            "    GA-117-2059",
-            "=" * 44,
-            f"  Date  : {now.strftime('%Y-%m-%d')}",
-            f"  Time  : {now.strftime('%H:%M:%S')}",
-            f"  Order : #{self.order_counter:04d}",
-            "-" * 44,
-            f"  {'ITEM':<22} {'QTY':>4}  {'AMOUNT':>8}",
-            "-" * 44,
+            sep,
+            self._center_receipt_text(f"{APP_NAME} Restaurant", width),
+            self._center_receipt_text("46 Patrice Lumumba Road, Airport", width),
+            self._center_receipt_text("P.O. Box 46, State House - Accra", width),
+            self._center_receipt_text("GA-117-2059", width),
+            sep,
+            f"Date : {now.strftime('%Y-%m-%d')}",
+            f"Time : {now.strftime('%H:%M:%S')}",
+            f"Order: #{self.order_counter:04d}",
+            mid,
+            _row("ITEM", "Q", "AMOUNT"),
+            mid,
         ]
+
         for item in items:
             line_total = item["price"] * item["qty"]
-            lines.append(f"  {item['name']:<22} {item['qty']:>4}  ₵{line_total:>7.2f}")
+            lines.append(_row(item["name"], item["qty"], f"GHS{line_total:.2f}"))
 
+        total_label_w = max(8, width - 13)
         lines += [
-            "-" * 44,
-            f"  {'Subtotal':<30}  ₵{subtotal:>7.2f}",
-            f"  {'Tax (15%)':<30}  ₵{tax:>7.2f}",
-            "=" * 44,
-            f"  {'TOTAL':<30}  ₵{total:>7.2f}",
-            "=" * 44,
-            f"  Payment: {payment}",
-            "",
-            "  Thank You For Your Patronage. See You Soon!.",
-            "=" * 44,
+            mid,
+            f"{'Subtotal':<{total_label_w}} GHS{subtotal:>9.2f}",
+            f"{f'Tax ({tax_pct:.0f}%)':<{total_label_w}} GHS{tax:>9.2f}",
+            sep,
+            f"{'TOTAL':<{total_label_w}} GHS{total:>9.2f}",
+            sep,
+            f"Payment: {payment}",
         ]
 
         if payment == "Cash" and cash_tendered is not None and change is not None:
-            lines.insert(-4, f"  {'Cash Tendered':<30}  ₵{cash_tendered:>7.2f}")
-            lines.insert(-4, f"  {'Change':<30}  ₵{change:>7.2f}")
+            lines.append(f"{'Cash Tendered':<{total_label_w}} GHS{cash_tendered:>9.2f}")
+            lines.append(f"{'Change':<{total_label_w}} GHS{change:>9.2f}")
+
+        lines += [
+            "",
+            self._center_receipt_text("Thank You For Your Patronage", width),
+            self._center_receipt_text("See You Soon!", width),
+            sep,
+        ]
 
         return "\n".join(lines)
 
     def _show_invoice_window(self, invoice: str):
+        printer_name = self._get_default_printer_name()
+        active_profile = self._get_receipt_profile(printer_name)
+        selected_mode = getattr(self, "receipt_paper_profile", "Auto")
+        if selected_mode == "Auto":
+            mode_detail = f"Auto ({printer_name if printer_name else 'No default printer'})"
+        else:
+            mode_detail = f"Manual ({selected_mode})"
+
         win = ctk.CTkToplevel(self)
         win.title("Order Receipt")
         win.geometry("500x640")
@@ -1270,6 +1727,13 @@ class BlazeBiteApp(ctk.CTk):
                      font=ctk.CTkFont("Helvetica", 18, "bold"),
                      text_color=COLORS["success"]).pack(pady=(18, 12))
 
+        ctk.CTkLabel(
+            win,
+            text=f"Print Profile: {active_profile['paper']}  |  {mode_detail}",
+            font=ctk.CTkFont("Helvetica", 10),
+            text_color=COLORS["text_muted"],
+        ).pack(pady=(0, 8))
+
         txt = ctk.CTkTextbox(win, fg_color=COLORS["bg_dark"],
                              text_color=COLORS["text_primary"],
                              font=ctk.CTkFont("Courier", 12),
@@ -1278,29 +1742,20 @@ class BlazeBiteApp(ctk.CTk):
         txt.insert("end", invoice)
         txt.configure(state="disabled")
 
-        def get_default_printer_name() -> str | None:
-            """Return the default Windows printer name, or None if unavailable."""
-            if os.name != "nt":
-                return None
-
-            try:
-                needed = wintypes.DWORD(0)
-                ctypes.windll.winspool.GetDefaultPrinterW(None, ctypes.byref(needed))
-                if needed.value <= 0:
-                    return None
-
-                buffer = ctypes.create_unicode_buffer(needed.value)
-                if ctypes.windll.winspool.GetDefaultPrinterW(buffer, ctypes.byref(needed)):
-                    name = buffer.value.strip()
-                    return name if name else None
-            except Exception:
-                return None
-
-            return None
-
         def send_file_to_printer(file_path: str, printer_name: str | None) -> tuple[bool, str]:
             """Try multiple print mechanisms so printing works across typical Windows setups."""
             abs_path = os.path.abspath(file_path)
+
+            # Preferred path for thermal printers: RAW spool preserves monospaced layout.
+            if printer_name:
+                try:
+                    raw_text = open(abs_path, "r", encoding="utf-8", errors="ignore").read()
+                except Exception:
+                    raw_text = None
+                if raw_text is not None:
+                    ok_raw, raw_msg = self._send_raw_to_printer(printer_name, raw_text + "\n\n\n")
+                    if ok_raw:
+                        return True, raw_msg
 
             try:
                 os.startfile(abs_path, "print")
@@ -1320,11 +1775,13 @@ class BlazeBiteApp(ctk.CTk):
         def print_invoice():
             # Save invoice to file and send directly to printer.
             app_data_dir = get_app_data_dir()
+            printer_name = self._get_default_printer_name()
+            printable_invoice = invoice
+
             fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
             with open(fname, "w", encoding="utf-8") as f:
-                f.write(invoice)
+                f.write(printable_invoice)
 
-            printer_name = get_default_printer_name()
             if not printer_name:
                 messagebox.showerror(
                     "Printer Not Detected",
@@ -1390,7 +1847,78 @@ class BlazeBiteApp(ctk.CTk):
         hist_lbl = ctk.CTkLabel(admin_scroll, text="📋  Transaction History",
                                 font=ctk.CTkFont("Helvetica", 16, "bold"),
                                 text_color=COLORS["text_primary"])
-        hist_lbl.pack(anchor="w", padx=20, pady=(16, 8))
+        hist_lbl.pack(anchor="w", padx=20, pady=(16, 4))
+
+        # ── Date-range filter bar ──
+        filter_bar = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                                   corner_radius=10, border_width=1,
+                                   border_color=COLORS["border"])
+        filter_bar.pack(fill="x", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(filter_bar, text="🗓  From:",
+                     font=ctk.CTkFont("Helvetica", 11),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(14, 4), pady=10)
+
+        self._tx_from_var = tk.StringVar()
+        self._tx_from_entry = ctk.CTkEntry(filter_bar, textvariable=self._tx_from_var,
+                                           width=110, height=34, corner_radius=8,
+                                           fg_color=COLORS["bg_hover"],
+                                           border_color=COLORS["border"],
+                                           placeholder_text="YYYY-MM-DD",
+                                           font=ctk.CTkFont("Helvetica", 11))
+        self._tx_from_entry.pack(side="left", padx=(0, 4), pady=10)
+
+        ctk.CTkButton(filter_bar, text="📅", width=34, height=34, corner_radius=8,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      font=ctk.CTkFont("Helvetica", 13),
+                      command=lambda: DatePickerPopup(
+                          self,
+                          lambda d: self._tx_from_var.set(d),
+                          self._tx_from_var.get() or None,
+                      )).pack(side="left", padx=(0, 10), pady=10)
+
+        ctk.CTkLabel(filter_bar, text="To:",
+                     font=ctk.CTkFont("Helvetica", 11),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 4), pady=10)
+
+        self._tx_to_var = tk.StringVar()
+        self._tx_to_entry = ctk.CTkEntry(filter_bar, textvariable=self._tx_to_var,
+                                         width=110, height=34, corner_radius=8,
+                                         fg_color=COLORS["bg_hover"],
+                                         border_color=COLORS["border"],
+                                         placeholder_text="YYYY-MM-DD",
+                                         font=ctk.CTkFont("Helvetica", 11))
+        self._tx_to_entry.pack(side="left", padx=(0, 4), pady=10)
+
+        ctk.CTkButton(filter_bar, text="📅", width=34, height=34, corner_radius=8,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      font=ctk.CTkFont("Helvetica", 13),
+                      command=lambda: DatePickerPopup(
+                          self,
+                          lambda d: self._tx_to_var.set(d),
+                          self._tx_to_var.get() or None,
+                      )).pack(side="left", padx=(0, 12), pady=10)
+
+        ctk.CTkButton(filter_bar, text="Apply Filter",
+                      width=110, height=34, corner_radius=8,
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+                      text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._apply_tx_filter).pack(side="left", padx=(0, 6), pady=10)
+
+        ctk.CTkButton(filter_bar, text="Clear",
+                      width=70, height=34, corner_radius=8,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_secondary"],
+                      font=ctk.CTkFont("Helvetica", 11),
+                      command=self._clear_tx_filter).pack(side="left", padx=(0, 10), pady=10)
+
+        self._tx_count_lbl = ctk.CTkLabel(filter_bar, text="",
+                                           font=ctk.CTkFont("Helvetica", 10),
+                                           text_color=COLORS["text_muted"])
+        self._tx_count_lbl.pack(side="right", padx=14, pady=10)
 
         # Table
         table_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
@@ -1446,19 +1974,97 @@ class BlazeBiteApp(ctk.CTk):
 
         self._build_product_management(prod_frame)
 
+        # Receipt printer settings
+        receipt_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                                     corner_radius=10, border_width=1,
+                                     border_color=COLORS["border"])
+        receipt_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(receipt_frame, text="🖨️  Receipt Paper Profile",
+                     font=ctk.CTkFont("Helvetica", 14, "bold"),
+                     text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 4))
+
+        receipt_row = ctk.CTkFrame(receipt_frame, fg_color="transparent")
+        receipt_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkLabel(receipt_row, text="Profile:",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 8))
+
+        self.admin_receipt_profile_var = tk.StringVar(value=self.receipt_paper_profile)
+        ctk.CTkComboBox(
+            receipt_row,
+            width=170,
+            height=32,
+            values=["Auto", "80mm", "58mm"],
+            variable=self.admin_receipt_profile_var,
+            command=lambda v: self._on_receipt_profile_changed(v),
+            fg_color=COLORS["bg_hover"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 11),
+        ).pack(side="left")
+
+        ctk.CTkLabel(receipt_row,
+                     text="Auto uses detected printer model (TM-T20II -> 80mm).",
+                     font=ctk.CTkFont("Helvetica", 10),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(10, 0))
+
+        # All-system item list (read-only)
+        ctk.CTkLabel(admin_scroll, text="🧾  All System Items",
+                     font=ctk.CTkFont("Helvetica", 16, "bold"),
+                     text_color=COLORS["text_primary"]).pack(anchor="w", padx=20, pady=(16, 8))
+
+        admin_items_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                                         corner_radius=10, border_width=1,
+                                         border_color=COLORS["border"], height=240)
+        admin_items_frame.pack(fill="x", padx=16, pady=(0, 12))
+        admin_items_frame.pack_propagate(False)
+
+        admin_items_filter_row = ctk.CTkFrame(admin_items_frame, fg_color="transparent")
+        admin_items_filter_row.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(admin_items_filter_row, text="Store:",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(4, 8))
+
+        self.admin_items_store_var = tk.StringVar(value="All")
+        ctk.CTkComboBox(
+            admin_items_filter_row,
+            width=150,
+            height=30,
+            values=["All", "Fast Food", "Cold Store"],
+            variable=self.admin_items_store_var,
+            command=lambda _v: self._on_admin_items_store_change(),
+            fg_color=COLORS["bg_hover"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 11),
+        ).pack(side="left")
+
+        admin_item_cols = ("Store", "Category", "Item", "Price (₵)", "Stock")
+        self.admin_items_tree = ttk.Treeview(
+            admin_items_frame,
+            columns=admin_item_cols,
+            show="headings",
+            style="Custom.Treeview",
+            height=7,
+        )
+        for col, width in zip(admin_item_cols, [110, 150, 260, 120, 100]):
+            self.admin_items_tree.heading(col, text=col)
+            self.admin_items_tree.column(col, width=width, anchor="center" if col != "Item" else "w")
+
+        admin_items_scroll = ttk.Scrollbar(admin_items_frame, orient="vertical",
+                                           command=self.admin_items_tree.yview)
+        self.admin_items_tree.configure(yscrollcommand=admin_items_scroll.set)
+        admin_items_scroll.pack(side="right", fill="y", padx=(0, 4), pady=6)
+        self.admin_items_tree.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
         # User management (credentials)
-        user_lbl = ctk.CTkLabel(admin_scroll, text="🔑  User Accounts",
-                                font=ctk.CTkFont("Helvetica", 16, "bold"),
-                                text_color=COLORS["text_primary"])
-        user_lbl.pack(anchor="w", padx=20, pady=(16, 8))
-
-        user_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
-                      corner_radius=10, height=210)
-        user_frame.pack(fill="x", padx=16, pady=(0, 12))
-        user_frame.pack_propagate(False)
-
-        self._build_user_management(user_frame)
-
         # ── Item Sales Report ──
         ctk.CTkLabel(admin_scroll, text="📈  Item Sales Report",
                      font=ctk.CTkFont("Helvetica", 16, "bold"),
@@ -1506,6 +2112,26 @@ class BlazeBiteApp(ctk.CTk):
             command=self._refresh_root_admin,
         ).pack(side="right", padx=(8, 4), pady=10)
 
+        self.root_receipt_profile_var = tk.StringVar(value=self.receipt_paper_profile)
+        ctk.CTkComboBox(
+            header,
+            width=110,
+            height=30,
+            values=["Auto", "80mm", "58mm"],
+            variable=self.root_receipt_profile_var,
+            command=lambda v: self._on_receipt_profile_changed(v),
+            fg_color=COLORS["bg_hover"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 10),
+        ).pack(side="right", padx=(8, 4), pady=10)
+
+        ctk.CTkLabel(header, text="Receipt:",
+                     font=ctk.CTkFont("Helvetica", 10, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="right", padx=(8, 2), pady=10)
+
         # User list section
         user_section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=10,
                                     border_width=1, border_color=COLORS["border"])
@@ -1547,6 +2173,51 @@ class BlazeBiteApp(ctk.CTk):
             text_color="white",
             command=lambda: self._toggle_user_status(False),
         ).pack(side="left", padx=4)
+
+        # All-system item list (read-only)
+        items_section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=10,
+                                     border_width=1, border_color=COLORS["border"])
+        items_section.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(items_section, text="System Items",
+                     font=ctk.CTkFont("Helvetica", 15, "bold"),
+                     text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 6))
+
+        root_items_filter_row = ctk.CTkFrame(items_section, fg_color="transparent")
+        root_items_filter_row.pack(fill="x", padx=8, pady=(0, 4))
+
+        ctk.CTkLabel(root_items_filter_row, text="Store:",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(4, 8))
+
+        self.root_items_store_var = tk.StringVar(value="All")
+        ctk.CTkComboBox(
+            root_items_filter_row,
+            width=150,
+            height=30,
+            values=["All", "Fast Food", "Cold Store"],
+            variable=self.root_items_store_var,
+            command=lambda _v: self._on_root_items_store_change(),
+            fg_color=COLORS["bg_hover"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 11),
+        ).pack(side="left")
+
+        root_item_cols = ("Store", "Category", "Item", "Price (₵)", "Stock")
+        self.root_items_tree = ttk.Treeview(items_section, columns=root_item_cols,
+                                            show="headings", height=10,
+                                            style="Custom.Treeview")
+        for col, width in zip(root_item_cols, [110, 150, 260, 120, 100]):
+            self.root_items_tree.heading(col, text=col)
+            self.root_items_tree.column(col, width=width, anchor="center" if col != "Item" else "w")
+
+        root_items_scroll = ttk.Scrollbar(items_section, orient="vertical", command=self.root_items_tree.yview)
+        self.root_items_tree.configure(yscrollcommand=root_items_scroll.set)
+        root_items_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        self.root_items_tree.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
         # Activity log section
         log_section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=10,
@@ -1596,6 +2267,12 @@ class BlazeBiteApp(ctk.CTk):
                 self.root_log_tree.delete(row)
             for _id, timestamp, actor_username, actor_role, action, target, details, store in self.db.get_activity_logs():
                 self.root_log_tree.insert("", "end", values=(timestamp, actor_username, actor_role, action, target, store))
+
+        if hasattr(self, "root_items_tree"):
+            self._populate_system_items_tree(
+                self.root_items_tree,
+                self.root_items_store_var.get() if hasattr(self, "root_items_store_var") else "All",
+            )
 
     def _open_root_add_user_dialog(self):
         if self.current_role != "root_admin":
@@ -1694,6 +2371,70 @@ class BlazeBiteApp(ctk.CTk):
         )
         self._refresh_root_admin()
 
+    def _apply_tx_filter(self):
+        """Apply the From/To date filter to the transaction table."""
+        from_str = self._tx_from_var.get().strip()
+        to_str   = self._tx_to_var.get().strip()
+
+        # Validate both dates
+        for val, label in [(from_str, "From"), (to_str, "To")]:
+            if val:
+                try:
+                    datetime.date.fromisoformat(val)
+                except ValueError:
+                    messagebox.showerror("Invalid Date",
+                                         f"{label} date '{val}' is not valid.\n"
+                                         "Use the format YYYY-MM-DD.")
+                    return
+
+        if from_str and to_str and from_str > to_str:
+            messagebox.showerror("Invalid Range",
+                                 "The 'From' date must be on or before the 'To' date.")
+            return
+
+        self._populate_tx_table()
+
+    def _clear_tx_filter(self):
+        """Clear the date filter and show all transactions."""
+        self._tx_from_var.set("")
+        self._tx_to_var.set("")
+        self._populate_tx_table()
+
+    def _populate_tx_table(self):
+        """Fill the transaction Treeview respecting any active date filter."""
+        from_str = self._tx_from_var.get().strip()
+        to_str   = self._tx_to_var.get().strip()
+
+        if from_str or to_str:
+            # Default missing bound to extreme values
+            f = from_str or "0001-01-01"
+            t = to_str   or "9999-12-31"
+            txs = self.db.get_transactions_by_date_range(f, t, store=self.active_store)
+        else:
+            txs = self.db.get_all_transactions(store=self.active_store)
+
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        for tx in txs:
+            items = json.loads(tx[3])
+            items_str = ", ".join(f"{i['qty']}× {i['name']}" for i in items)
+            self.tree.insert("", "end", values=(
+                f"#{tx[8]:04d}", tx[1], tx[2],
+                items_str,
+                f"₵{tx[4]:.2f}", f"₵{tx[5]:.2f}", f"₵{tx[6]:.2f}",
+                tx[7],
+            ))
+
+        # Update result count label
+        if hasattr(self, "_tx_count_lbl"):
+            if from_str or to_str:
+                self._tx_count_lbl.configure(
+                    text=f"{len(txs)} result{'s' if len(txs) != 1 else ''} found"
+                )
+            else:
+                self._tx_count_lbl.configure(text=f"{len(txs)} total")
+
     def _refresh_admin(self):
         # ── Summary cards ──
         for widget in self.admin_cards_frame.winfo_children():
@@ -1726,27 +2467,45 @@ class BlazeBiteApp(ctk.CTk):
                          text_color=color)
             value_widget.pack(pady=(0, 14))
 
-        # ── Populate table efficiently ──
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
-        for tx in all_tx:
-            # tx: id, date, time, items_json, subtotal, tax, total, payment, order_number
-            items = json.loads(tx[3])
-            items_str = ", ".join(f"{i['qty']}× {i['name']}" for i in items)
-            self.tree.insert("", "end", values=(
-                f"#{tx[8]:04d}", tx[1], tx[2],
-                items_str,
-                f"₵{tx[4]:.2f}", f"₵{tx[5]:.2f}", f"₵{tx[6]:.2f}",
-                tx[7],
-            ))
-
-        # Refresh user list
-        self._refresh_user_management()
+        # ── Populate table (respects active date filter) ──
+        self._populate_tx_table()
 
         # Refresh item report combo list
         if hasattr(self, "report_item_combo"):
             self._refresh_item_report_items()
+
+        if hasattr(self, "admin_items_tree"):
+            self._populate_system_items_tree(
+                self.admin_items_tree,
+                self.admin_items_store_var.get() if hasattr(self, "admin_items_store_var") else "All",
+            )
+
+    def _on_admin_items_store_change(self):
+        if hasattr(self, "admin_items_tree") and hasattr(self, "admin_items_store_var"):
+            self._populate_system_items_tree(self.admin_items_tree, self.admin_items_store_var.get())
+
+    def _on_root_items_store_change(self):
+        if hasattr(self, "root_items_tree") and hasattr(self, "root_items_store_var"):
+            self._populate_system_items_tree(self.root_items_tree, self.root_items_store_var.get())
+
+    def _populate_system_items_tree(self, tree_widget, store_filter: str = "All"):
+        for row in tree_widget.get_children():
+            tree_widget.delete(row)
+
+        store_map = {
+            "All": None,
+            "Fast Food": "fast_food",
+            "Cold Store": "cold_store",
+        }
+        selected_store = store_map.get(store_filter, None)
+
+        for row in self.db.get_all_products(store=selected_store):
+            store = STORE_LABELS.get(row[6], row[6])
+            category = row[1]
+            name = row[2]
+            price = f"{row[3]:,.2f}"
+            stock = str(row[5])
+            tree_widget.insert("", "end", values=(store, category, name, price, stock))
 
     # ─────────────────────────────────────────
     #  UTILITIES
@@ -1823,7 +2582,15 @@ class BlazeBiteApp(ctk.CTk):
                      text_color=COLORS["text_secondary"]).pack(side="left")
 
         self.report_period_var = tk.StringVar(value="Daily")
-        for label in ("Daily", "Weekly", "Monthly"):
+
+        def _on_period_change():
+            self._refresh_item_report_items()
+            if self.report_period_var.get() == "Custom":
+                self._report_date_row.pack(fill="x", pady=(8, 0))
+            else:
+                self._report_date_row.pack_forget()
+
+        for label in ("Daily", "Weekly", "Monthly", "Custom"):
             ctk.CTkRadioButton(
                 row1, text=label,
                 variable=self.report_period_var, value=label,
@@ -1831,7 +2598,7 @@ class BlazeBiteApp(ctk.CTk):
                 border_color=COLORS["accent_soft"],
                 text_color=COLORS["text_primary"],
                 font=ctk.CTkFont("Helvetica", 12),
-                command=self._refresh_item_report_items,
+                command=_on_period_change,
             ).pack(side="left", padx=(14, 0))
 
         ctk.CTkFrame(row1, fg_color=COLORS["border"], width=1, height=28).pack(
@@ -1861,6 +2628,55 @@ class BlazeBiteApp(ctk.CTk):
             font=ctk.CTkFont("Helvetica", 12, "bold"),
             command=self._run_item_report,
         ).pack(side="left")
+
+        # ── Row 1b: Custom date-range picker (hidden until "Custom" is selected) ──
+        self._report_date_row = ctk.CTkFrame(inner, fg_color=COLORS["bg_panel"],
+                                              corner_radius=8, border_width=1,
+                                              border_color=COLORS["border"])
+        # Not packed yet – shown only when Custom period is active
+
+        ctk.CTkLabel(self._report_date_row, text="🗓  From:",
+                     font=ctk.CTkFont("Helvetica", 11),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(14, 4), pady=8)
+
+        self._rpt_from_var = tk.StringVar()
+        ctk.CTkEntry(self._report_date_row, textvariable=self._rpt_from_var,
+                     width=110, height=32, corner_radius=7,
+                     fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                     placeholder_text="YYYY-MM-DD",
+                     font=ctk.CTkFont("Helvetica", 11)).pack(side="left", padx=(0, 4), pady=8)
+
+        ctk.CTkButton(self._report_date_row, text="📅", width=32, height=32, corner_radius=7,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"], font=ctk.CTkFont("Helvetica", 13),
+                      command=lambda: DatePickerPopup(
+                          self, lambda d: self._rpt_from_var.set(d),
+                          self._rpt_from_var.get() or None,
+                      )).pack(side="left", padx=(0, 16), pady=8)
+
+        ctk.CTkLabel(self._report_date_row, text="To:",
+                     font=ctk.CTkFont("Helvetica", 11),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 4), pady=8)
+
+        self._rpt_to_var = tk.StringVar()
+        ctk.CTkEntry(self._report_date_row, textvariable=self._rpt_to_var,
+                     width=110, height=32, corner_radius=7,
+                     fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                     placeholder_text="YYYY-MM-DD",
+                     font=ctk.CTkFont("Helvetica", 11)).pack(side="left", padx=(0, 4), pady=8)
+
+        ctk.CTkButton(self._report_date_row, text="📅", width=32, height=32, corner_radius=7,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"], font=ctk.CTkFont("Helvetica", 13),
+                      command=lambda: DatePickerPopup(
+                          self, lambda d: self._rpt_to_var.set(d),
+                          self._rpt_to_var.get() or None,
+                      )).pack(side="left", padx=(0, 10), pady=8)
+
+        ctk.CTkLabel(self._report_date_row,
+                     text="Slots auto-selected: daily ≤31 days · weekly ≤91 days · monthly otherwise",
+                     font=ctk.CTkFont("Helvetica", 9),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(4, 16), pady=8)
 
         # ── Row 2: results display ──
         row2 = ctk.CTkFrame(inner, fg_color=COLORS["bg_panel"],
@@ -1917,14 +2733,18 @@ class BlazeBiteApp(ctk.CTk):
         self.report_tree.pack(fill="x")
 
     def _refresh_item_report_items(self):
-        """Update the item combo-box list based on what's actually been sold."""
-        names = self.db.get_all_item_names(store=self.active_store)
+        """Update the item combo-box list for the current user's access scope."""
+        if self.current_role in ("admin", "root_admin"):
+            names = sorted({row[2] for row in self.db.get_all_products(store=None)})
+        else:
+            names = self.db.get_all_item_names(store=self.active_store)
         self.report_item_combo.configure(values=names if names else ["(no transactions yet)"])
         if names and not self.report_item_var.get():
             self.report_item_var.set(names[0])
 
     def _run_item_report(self):
         """Query the DB and populate the report results panel."""
+        import calendar as _cal
         item_name = self.report_item_var.get().strip()
         period    = self.report_period_var.get()
 
@@ -1934,8 +2754,63 @@ class BlazeBiteApp(ctk.CTk):
 
         today      = datetime.date.today()
         date_slots: list[tuple[str, str, str]] = []  # (slot_label, date_from, date_to)
+        period_display = period
+        date_from = date_to = None  # set explicitly for Custom; derived from slots otherwise
 
-        if period == "Daily":
+        if period == "Custom":
+            from_str = self._rpt_from_var.get().strip()
+            to_str   = self._rpt_to_var.get().strip()
+            if not from_str or not to_str:
+                messagebox.showwarning("Date Required",
+                                       "Please enter both From and To dates for the custom range.")
+                return
+            try:
+                cust_from = datetime.date.fromisoformat(from_str)
+                cust_to   = datetime.date.fromisoformat(to_str)
+            except ValueError:
+                messagebox.showerror("Invalid Date",
+                                     "Dates must be in YYYY-MM-DD format (e.g. 2024-01-15).")
+                return
+            if cust_from > cust_to:
+                messagebox.showerror("Invalid Range", "'From' date must be on or before 'To' date.")
+                return
+
+            span = (cust_to - cust_from).days + 1
+            if span <= 31:
+                slot_label = "daily"
+                d = cust_from
+                while d <= cust_to:
+                    label = d.strftime("%Y-%m-%d")
+                    date_slots.append((label, label, label))
+                    d += datetime.timedelta(days=1)
+            elif span <= 91:
+                slot_label = "weekly"
+                week_start = cust_from - datetime.timedelta(days=cust_from.weekday())
+                while week_start <= cust_to:
+                    week_end  = week_start + datetime.timedelta(days=6)
+                    slot_from = max(week_start, cust_from).isoformat()
+                    slot_to   = min(week_end,   cust_to).isoformat()
+                    label = f"Week {week_start.strftime('%d %b')} – {week_end.strftime('%d %b %Y')}"
+                    date_slots.append((label, slot_from, slot_to))
+                    week_start += datetime.timedelta(weeks=1)
+            else:
+                slot_label = "monthly"
+                yr, mo = cust_from.year, cust_from.month
+                while datetime.date(yr, mo, 1) <= cust_to:
+                    _, last = _cal.monthrange(yr, mo)
+                    m_start = max(datetime.date(yr, mo, 1),    cust_from).isoformat()
+                    m_end   = min(datetime.date(yr, mo, last), cust_to).isoformat()
+                    label   = datetime.date(yr, mo, 1).strftime("%B %Y")
+                    date_slots.append((label, m_start, m_end))
+                    mo += 1
+                    if mo > 12:
+                        mo, yr = 1, yr + 1
+
+            period_display = f"Custom ({slot_label})"
+            date_from = cust_from.isoformat()
+            date_to   = cust_to.isoformat()
+
+        elif period == "Daily":
             # Last 30 days, one slot per day
             for d in range(30):
                 day = today - datetime.timedelta(days=d)
@@ -1950,7 +2825,7 @@ class BlazeBiteApp(ctk.CTk):
                 label = f"Week {week_start.strftime('%d %b')} – {week_end.strftime('%d %b %Y')}"
                 date_slots.append((label, week_start.isoformat(), week_end.isoformat()))
 
-        else:  # Monthly
+        else:  # Monthly — fixed to use calendar.monthrange
             # Last 12 months
             for m in range(12):
                 year  = today.year
@@ -1959,14 +2834,15 @@ class BlazeBiteApp(ctk.CTk):
                     month += 12
                     year  -= 1
                 first = datetime.date(year, month, 1)
-                last_day = (first.replace(month=month % 12 + 1, day=1)
-                            - datetime.timedelta(days=1)) if month < 12 else datetime.date(year, 12, 31)
+                _, last = _cal.monthrange(year, month)
+                last_day = datetime.date(year, month, last)
                 label = first.strftime("%B %Y")
                 date_slots.append((label, first.isoformat(), last_day.isoformat()))
 
-        # Overall range
-        date_from  = date_slots[-1][1]
-        date_to    = date_slots[0][2]
+        if date_from is None:
+            date_from = date_slots[-1][1]
+            date_to   = date_slots[0][2]
+
         total_qty, total_rev = self.db.get_item_report(
             item_name, date_from, date_to, store=self.active_store
         )
@@ -1974,11 +2850,9 @@ class BlazeBiteApp(ctk.CTk):
         # Update metric cards
         self.report_qty_lbl.configure(text=str(total_qty))
         self.report_rev_lbl.configure(text=f"₵{total_rev:,.2f}")
-        self.report_range_lbl.configure(
-            text=f"{date_from}  →  {date_to}"
-        )
+        self.report_range_lbl.configure(text=f"{date_from}  →  {date_to}")
         self.report_period_lbl.configure(
-            text=f"  {period} breakdown for  '{item_name}'"
+            text=f"  {period_display} breakdown for  '{item_name}'"
         )
 
         # Clear and fill breakdown tree  (skip zero rows)
@@ -2011,6 +2885,11 @@ class BlazeBiteApp(ctk.CTk):
                 # Name
                 name_label = ctk.CTkLabel(item_frame, text=item['name'], font=ctk.CTkFont("Helvetica", 12, "bold"), text_color=COLORS["text_primary"])
                 name_label.pack(side="left", padx=12, pady=10)
+                # Stock quantity badge
+                qty = item.get('quantity', 0)
+                qty_color = COLORS["success"] if qty > 0 else COLORS["error"]
+                qty_label = ctk.CTkLabel(item_frame, text=f"Stock: {qty}", font=ctk.CTkFont("Helvetica", 10, "bold"), text_color=qty_color)
+                qty_label.pack(side="left", padx=8, pady=10)
                 # Current price
                 price_var = ctk.StringVar(value=f"{item['price']:.2f}")
                 price_entry = ctk.CTkEntry(item_frame, textvariable=price_var, width=80, fg_color=COLORS["bg_hover"], border_color=COLORS["border"])
@@ -2419,7 +3298,7 @@ class BlazeBiteApp(ctk.CTk):
             return
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Product" if product is None else "Edit Product")
-        dialog.geometry("420x380")
+        dialog.geometry("420x440")
         dialog.transient(self)
         dialog.grab_set()
         dialog.configure(fg_color=COLORS["bg_dark"])
@@ -2449,6 +3328,15 @@ class BlazeBiteApp(ctk.CTk):
         if product:
             price_entry.insert(0, str(product['price']))
 
+        # Quantity in Stock
+        ctk.CTkLabel(dialog, text="Quantity in Stock:").pack(pady=5)
+        qty_entry = ctk.CTkEntry(dialog)
+        qty_entry.pack(pady=5)
+        if product:
+            qty_entry.insert(0, str(product.get('quantity', 0)))
+        else:
+            qty_entry.insert(0, "0")
+
         # Desc
         ctk.CTkLabel(dialog, text="Description:").pack(pady=5)
         desc_entry = ctk.CTkEntry(dialog)
@@ -2462,24 +3350,27 @@ class BlazeBiteApp(ctk.CTk):
                 cat = cat_var.get()
                 name = name_entry.get().strip()
                 price = float(price_entry.get())
+                quantity = int(qty_entry.get().strip() or "0")
                 desc = desc_entry.get().strip()
                 if not name:
                     raise ValueError("Name required")
+                if quantity < 0:
+                    raise ValueError("Quantity cannot be negative")
                 if product:
                     action = "EDIT_PRODUCT"
                     target = product['name']
-                    self.db.update_product(product['id'], cat, name, price, desc, store)
+                    self.db.update_product(product['id'], cat, name, price, desc, quantity, store)
                 else:
                     action = "ADD_PRODUCT"
                     target = name
-                    self.db.add_product(cat, name, price, desc, store)
+                    self.db.add_product(cat, name, price, desc, quantity, store)
                 self.menu_data = self._load_menu()
                 self.db.log_activity(
                     self.current_user or "unknown",
                     self.current_role or "admin",
                     action,
                     target,
-                    f"category={cat}, price={price:.2f}",
+                    f"category={cat}, price={price:.2f}, qty={quantity}",
                     store=store or "system",
                 )
                 self._render_category(self.active_category)
