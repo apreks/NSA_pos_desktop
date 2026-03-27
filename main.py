@@ -190,6 +190,7 @@ class Database:
         self._ensure_column("transactions", "store", "TEXT", default="fast_food")
         self._ensure_column("products", "store", "TEXT", default="fast_food")
         self._ensure_column("products", "quantity", "INTEGER", default=0)
+        self._ensure_column("products", "archived", "INTEGER", default=0)
         self._ensure_column("users", "disabled", "INTEGER", default=0)
 
     def _has_column(self, table: str, column: str) -> bool:
@@ -307,14 +308,17 @@ class Database:
         sorted_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
         return sorted_items[:limit]
 
-    def get_all_products(self, store: str | None = None):
+    def get_all_products(self, store: str | None = None, include_archived: bool = False):
+        archive_filter = "" if include_archived else " AND COALESCE(archived,0)=0"
         if store:
             cur = self.conn.execute(
-                "SELECT * FROM products WHERE store = ? ORDER BY category, name",
+                f"SELECT * FROM products WHERE store = ?{archive_filter} ORDER BY category, name",
                 (store,),
             )
         else:
-            cur = self.conn.execute("SELECT * FROM products ORDER BY store, category, name")
+            cur = self.conn.execute(
+                f"SELECT * FROM products WHERE 1=1{archive_filter} ORDER BY store, category, name"
+            )
         return cur.fetchall()
 
     def add_product(self, category, name, price, desc, quantity: int = 0, store: str = "fast_food"):
@@ -328,6 +332,13 @@ class Database:
         self.conn.execute(
             "UPDATE products SET category=?, name=?, price=?, desc=?, quantity=?, store=? WHERE id=?",
             (category, name, price, desc, quantity, store, id),
+        )
+        self.conn.commit()
+
+    def set_product_archived(self, product_id: int, archived: bool = True):
+        self.conn.execute(
+            "UPDATE products SET archived=? WHERE id=?",
+            (1 if archived else 0, product_id),
         )
         self.conn.commit()
 
@@ -2046,7 +2057,7 @@ class BlazeBiteApp(ctk.CTk):
             font=ctk.CTkFont("Helvetica", 11),
         ).pack(side="left")
 
-        admin_item_cols = ("Store", "Category", "Item", "Price (₵)", "Stock")
+        admin_item_cols = ("Store", "Category", "Item", "Price (₵)", "Stock", "Status")
         self.admin_items_tree = ttk.Treeview(
             admin_items_frame,
             columns=admin_item_cols,
@@ -2054,7 +2065,7 @@ class BlazeBiteApp(ctk.CTk):
             style="Custom.Treeview",
             height=7,
         )
-        for col, width in zip(admin_item_cols, [110, 150, 260, 120, 100]):
+        for col, width in zip(admin_item_cols, [110, 150, 240, 120, 90, 100]):
             self.admin_items_tree.heading(col, text=col)
             self.admin_items_tree.column(col, width=width, anchor="center" if col != "Item" else "w")
 
@@ -2063,6 +2074,31 @@ class BlazeBiteApp(ctk.CTk):
         self.admin_items_tree.configure(yscrollcommand=admin_items_scroll.set)
         admin_items_scroll.pack(side="right", fill="y", padx=(0, 4), pady=6)
         self.admin_items_tree.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        admin_item_actions = ctk.CTkFrame(admin_items_frame, fg_color="transparent")
+        admin_item_actions.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkButton(
+            admin_item_actions,
+            text="Archive Selected",
+            height=30,
+            fg_color=COLORS["warning"],
+            hover_color="#D97706",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=lambda: self._set_selected_system_item_archive(self.admin_items_tree, True),
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            admin_item_actions,
+            text="Unarchive Selected",
+            height=30,
+            fg_color=COLORS["success"],
+            hover_color="#059669",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=lambda: self._set_selected_system_item_archive(self.admin_items_tree, False),
+        ).pack(side="left")
 
         # User management (credentials)
         # ── Item Sales Report ──
@@ -2206,11 +2242,11 @@ class BlazeBiteApp(ctk.CTk):
             font=ctk.CTkFont("Helvetica", 11),
         ).pack(side="left")
 
-        root_item_cols = ("Store", "Category", "Item", "Price (₵)", "Stock")
+        root_item_cols = ("Store", "Category", "Item", "Price (₵)", "Stock", "Status")
         self.root_items_tree = ttk.Treeview(items_section, columns=root_item_cols,
                                             show="headings", height=10,
                                             style="Custom.Treeview")
-        for col, width in zip(root_item_cols, [110, 150, 260, 120, 100]):
+        for col, width in zip(root_item_cols, [110, 150, 240, 120, 90, 100]):
             self.root_items_tree.heading(col, text=col)
             self.root_items_tree.column(col, width=width, anchor="center" if col != "Item" else "w")
 
@@ -2218,6 +2254,31 @@ class BlazeBiteApp(ctk.CTk):
         self.root_items_tree.configure(yscrollcommand=root_items_scroll.set)
         root_items_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
         self.root_items_tree.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+
+        root_item_actions = ctk.CTkFrame(items_section, fg_color="transparent")
+        root_item_actions.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkButton(
+            root_item_actions,
+            text="Archive Selected",
+            height=30,
+            fg_color=COLORS["warning"],
+            hover_color="#D97706",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=lambda: self._set_selected_system_item_archive(self.root_items_tree, True),
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            root_item_actions,
+            text="Unarchive Selected",
+            height=30,
+            fg_color=COLORS["success"],
+            hover_color="#059669",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=lambda: self._set_selected_system_item_archive(self.root_items_tree, False),
+        ).pack(side="left")
 
         # Activity log section
         log_section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=10,
@@ -2488,6 +2549,59 @@ class BlazeBiteApp(ctk.CTk):
         if hasattr(self, "root_items_tree") and hasattr(self, "root_items_store_var"):
             self._populate_system_items_tree(self.root_items_tree, self.root_items_store_var.get())
 
+    def _set_selected_system_item_archive(self, tree_widget, archive: bool):
+        if self.current_role not in ("admin", "root_admin"):
+            messagebox.showerror("Access Denied", "Only admin accounts can archive/unarchive products.")
+            return
+
+        selected = tree_widget.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Select a product first.")
+            return
+
+        item_id = int(selected[0])
+        values = tree_widget.item(selected[0], "values")
+        item_name = values[2] if len(values) > 2 else f"Product #{item_id}"
+        store_display = values[0] if len(values) > 0 else (self.active_store or "system")
+        status = values[5] if len(values) > 5 else ""
+
+        if archive and status == "Archived":
+            messagebox.showinfo("No Change", f"'{item_name}' is already archived.")
+            return
+        if (not archive) and status == "Active":
+            messagebox.showinfo("No Change", f"'{item_name}' is already active.")
+            return
+
+        action_word = "archive" if archive else "unarchive"
+        if not messagebox.askyesno("Confirm", f"Are you sure you want to {action_word} '{item_name}'?"):
+            return
+
+        self.db.set_product_archived(item_id, archive)
+        self.menu_data = self._load_menu()
+
+        store_key = {
+            "Fast Food": "fast_food",
+            "Cold Store": "cold_store",
+        }.get(store_display, store_display.lower() if isinstance(store_display, str) else "system")
+
+        self.db.log_activity(
+            self.current_user or "unknown",
+            self.current_role or "admin",
+            "ARCHIVE_PRODUCT" if archive else "UNARCHIVE_PRODUCT",
+            item_name,
+            f"via_system_items_table={True}",
+            store=store_key or "system",
+        )
+
+        if hasattr(self, "prod_scroll"):
+            self._refresh_product_management()
+        if hasattr(self, "report_item_combo"):
+            self._refresh_item_report_items()
+        if hasattr(self, "admin_items_tree") and hasattr(self, "admin_items_store_var"):
+            self._populate_system_items_tree(self.admin_items_tree, self.admin_items_store_var.get())
+        if hasattr(self, "root_items_tree") and hasattr(self, "root_items_store_var"):
+            self._populate_system_items_tree(self.root_items_tree, self.root_items_store_var.get())
+
     def _populate_system_items_tree(self, tree_widget, store_filter: str = "All"):
         for row in tree_widget.get_children():
             tree_widget.delete(row)
@@ -2499,13 +2613,14 @@ class BlazeBiteApp(ctk.CTk):
         }
         selected_store = store_map.get(store_filter, None)
 
-        for row in self.db.get_all_products(store=selected_store):
+        for row in self.db.get_all_products(store=selected_store, include_archived=True):
             store = STORE_LABELS.get(row[6], row[6])
             category = row[1]
             name = row[2]
             price = f"{row[3]:,.2f}"
             stock = str(row[5])
-            tree_widget.insert("", "end", values=(store, category, name, price, stock))
+            status = "Archived" if len(row) > 7 and row[7] else "Active"
+            tree_widget.insert("", "end", iid=str(row[0]), values=(store, category, name, price, stock, status))
 
     # ─────────────────────────────────────────
     #  UTILITIES
@@ -2543,7 +2658,7 @@ class BlazeBiteApp(ctk.CTk):
             return None
 
         for row in products:
-            # row: id, category, name, price, desc, store
+            # row: id, category, name, price, desc, quantity, store, archived
             cat = row[1]
             key = find_category_key(cat)
             item = {
@@ -2552,7 +2667,9 @@ class BlazeBiteApp(ctk.CTk):
                 'name': row[2],
                 'price': row[3],
                 'desc': row[4],
-                'store': row[5] if len(row) > 5 else self.active_store,
+                'quantity': row[5] if len(row) > 5 else 0,
+                'store': row[6] if len(row) > 6 else self.active_store,
+                'archived': bool(row[7]) if len(row) > 7 else False,
             }
             if key:
                 menu[key].append(item)
@@ -2900,6 +3017,9 @@ class BlazeBiteApp(ctk.CTk):
                 # Edit button
                 edit_btn = ctk.CTkButton(item_frame, text="Edit", width=65, height=32, corner_radius=7, fg_color=COLORS["warning"], text_color="white", font=ctk.CTkFont("Helvetica", 11, "bold"), command=lambda i=item: self._edit_product(i))
                 edit_btn.pack(side="right", padx=5, pady=10)
+                # Archive button
+                archive_btn = ctk.CTkButton(item_frame, text="Archive", width=72, height=32, corner_radius=7, fg_color=COLORS["text_muted"], text_color="white", font=ctk.CTkFont("Helvetica", 11, "bold"), command=lambda i=item: self._archive_product(i))
+                archive_btn.pack(side="right", padx=5, pady=10)
                 # Delete button
                 delete_btn = ctk.CTkButton(item_frame, text="Delete", width=65, height=32, corner_radius=7, fg_color=COLORS["error"], text_color="white", font=ctk.CTkFont("Helvetica", 11, "bold"), command=lambda i=item: self._delete_product(i))
                 delete_btn.pack(side="right", padx=5, pady=10)
@@ -2913,7 +3033,8 @@ class BlazeBiteApp(ctk.CTk):
             old_price = float(item['price'])
             new_price = float(price_var.get())
             store = item.get('store', self.active_store)
-            self.db.update_product(item['id'], item['category'], item['name'], new_price, item['desc'], store)
+            qty = int(item.get('quantity', 0) or 0)
+            self.db.update_product(item['id'], item['category'], item['name'], new_price, item['desc'], qty, store)
             self.menu_data = self._load_menu()
             self.db.log_activity(
                 self.current_user or "unknown",
@@ -2927,6 +3048,36 @@ class BlazeBiteApp(ctk.CTk):
             self._refresh_product_management()
         except ValueError:
             messagebox.showerror("Error", "Invalid price")
+
+    def _archive_product(self, item):
+        if self.current_role != "admin":
+            messagebox.showerror("Access Denied", "Only admin accounts can archive products.")
+            return
+
+        qty = int(item.get("quantity", 0) or 0)
+        if qty > 0:
+            msg = (
+                f"'{item['name']}' still has stock ({qty}).\n"
+                "Archive anyway?"
+            )
+        else:
+            msg = f"Archive '{item['name']}'? It will no longer appear for active sales."
+
+        if not messagebox.askyesno("Confirm Archive", msg):
+            return
+
+        store = item.get('store', self.active_store)
+        self.db.set_product_archived(item['id'], True)
+        self.menu_data = self._load_menu()
+        self.db.log_activity(
+            self.current_user or "unknown",
+            self.current_role or "admin",
+            "ARCHIVE_PRODUCT",
+            item['name'],
+            f"category={item.get('category', '')}, qty={qty}",
+            store=store or "system",
+        )
+        self._refresh_product_management()
 
     def _delete_product(self, item):
         if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete '{item['name']}'?"):
