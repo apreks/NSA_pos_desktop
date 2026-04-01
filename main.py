@@ -18,6 +18,7 @@ from tkinter import messagebox, ttk
 import tkinter as tk
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from PIL import Image as PILImage, ImageTk
 
 # ─────────────────────────────────────────────
 #  APP DATA DIRECTORY SETUP
@@ -186,6 +187,15 @@ class Database:
                 store         TEXT    NOT NULL
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                store      TEXT    NOT NULL,
+                name       TEXT    NOT NULL,
+                sort_order INTEGER DEFAULT 0,
+                UNIQUE(store, name)
+            )
+        """)
         self.conn.commit()
 
         # Ensure schema has store information for filtering by POS
@@ -193,6 +203,7 @@ class Database:
         self._ensure_column("products", "store", "TEXT", default="fast_food")
         self._ensure_column("products", "quantity", "INTEGER", default=0)
         self._ensure_column("products", "archived", "INTEGER", default=0)
+        self._ensure_column("products", "barcode", "TEXT", default="")
         self._ensure_column("users", "disabled", "INTEGER", default=0)
 
     def _has_column(self, table: str, column: str) -> bool:
@@ -323,19 +334,35 @@ class Database:
             )
         return cur.fetchall()
 
-    def add_product(self, category, name, price, desc, quantity: int = 0, store: str = "fast_food"):
+    def add_product(self, category, name, price, desc, quantity: int = 0, store: str = "fast_food", barcode: str = ""):
         self.conn.execute(
-            "INSERT INTO products (category, name, price, desc, quantity, store) VALUES (?, ?, ?, ?, ?, ?)",
-            (category, name, price, desc, quantity, store),
+            "INSERT INTO products (category, name, price, desc, quantity, store, barcode) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (category, name, price, desc, quantity, store, barcode),
         )
         self.conn.commit()
 
-    def update_product(self, id, category, name, price, desc, quantity: int = 0, store: str = "fast_food"):
+    def update_product(self, id, category, name, price, desc, quantity: int = 0, store: str = "fast_food", barcode: str = ""):
         self.conn.execute(
-            "UPDATE products SET category=?, name=?, price=?, desc=?, quantity=?, store=? WHERE id=?",
-            (category, name, price, desc, quantity, store, id),
+            "UPDATE products SET category=?, name=?, price=?, desc=?, quantity=?, store=?, barcode=? WHERE id=?",
+            (category, name, price, desc, quantity, store, barcode, id),
         )
         self.conn.commit()
+
+    def find_product_by_barcode(self, barcode: str, store: str | None = None):
+        """Return a product row matching the given barcode, or None."""
+        if not barcode:
+            return None
+        if store:
+            cur = self.conn.execute(
+                "SELECT * FROM products WHERE barcode=? AND store=? AND COALESCE(archived,0)=0 LIMIT 1",
+                (barcode.strip(), store),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT * FROM products WHERE barcode=? AND COALESCE(archived,0)=0 LIMIT 1",
+                (barcode.strip(),),
+            )
+        return cur.fetchone()
 
     def set_product_archived(self, product_id: int, archived: bool = True):
         self.conn.execute(
@@ -490,6 +517,60 @@ class Database:
         self.conn.execute("DELETE FROM products WHERE id=?", (id,))
         self.conn.commit()
 
+    # ── Category CRUD ──────────────────────────────────────────
+    def get_categories(self, store: str | None = None) -> list:
+        """Return categories as list of (id, store, name, sort_order)."""
+        if store:
+            cur = self.conn.execute(
+                "SELECT id, store, name, sort_order FROM categories WHERE store=? ORDER BY sort_order, name",
+                (store,),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT id, store, name, sort_order FROM categories ORDER BY store, sort_order, name"
+            )
+        return cur.fetchall()
+
+    def add_category(self, store: str, name: str, sort_order: int = 0):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO categories (store, name, sort_order) VALUES (?, ?, ?)",
+            (store, name, sort_order),
+        )
+        self.conn.commit()
+
+    def update_category(self, cat_id: int, name: str, sort_order: int | None = None):
+        if sort_order is not None:
+            self.conn.execute(
+                "UPDATE categories SET name=?, sort_order=? WHERE id=?",
+                (name, sort_order, cat_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE categories SET name=? WHERE id=?",
+                (name, cat_id),
+            )
+        self.conn.commit()
+
+    def rename_category_in_products(self, store: str, old_name: str, new_name: str):
+        """Rename a category across all products in a store."""
+        self.conn.execute(
+            "UPDATE products SET category=? WHERE category=? AND store=?",
+            (new_name, old_name, store),
+        )
+        self.conn.commit()
+
+    def delete_category(self, cat_id: int):
+        self.conn.execute("DELETE FROM categories WHERE id=?", (cat_id,))
+        self.conn.commit()
+
+    def get_category_names(self, store: str) -> list[str]:
+        """Return ordered list of category names for a store."""
+        rows = self.conn.execute(
+            "SELECT name FROM categories WHERE store=? ORDER BY sort_order, name",
+            (store,),
+        )
+        return [r[0] for r in rows.fetchall()]
+
     def initialize_products(self):
         """Ensure all products and default users exist.
 
@@ -497,11 +578,15 @@ class Database:
         missing rows.
         """
         for store_key, menu in STORE_MENUS.items():
-            for cat, items in menu.items():
+            for idx, (cat, items) in enumerate(menu.items()):
+                # Seed category
+                self.add_category(store_key, cat, sort_order=idx)
                 for item in items:
+                    # Check by name+store only (ignore category) so renamed
+                    # categories don't cause duplicate product rows.
                     exists = self.conn.execute(
-                        "SELECT 1 FROM products WHERE name=? AND category=? AND store=?",
-                        (item["name"], cat, store_key),
+                        "SELECT 1 FROM products WHERE name=? AND store=?",
+                        (item["name"], store_key),
                     ).fetchone()
                     if not exists:
                         self.add_product(cat, item["name"], item["price"], item["desc"], store=store_key)
@@ -539,6 +624,7 @@ class Database:
                 "quantity": row[5] if len(row) > 5 else 0,
                 "store": row[6] if len(row) > 6 else "fast_food",
                 "archived": row[7] if len(row) > 7 else 0,
+                "barcode": row[8] if len(row) > 8 else "",
             })
         for row in self.conn.execute("SELECT * FROM users ORDER BY id").fetchall():
             data["users"].append({
@@ -589,11 +675,11 @@ class Database:
                     continue
             self.conn.execute(
                 """INSERT INTO products
-                   (id, category, name, price, desc, quantity, store, archived)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                   (id, category, name, price, desc, quantity, store, archived, barcode)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (p["id"], p["category"], p["name"], p["price"], p["desc"],
                  p.get("quantity", 0), p.get("store", "fast_food"),
-                 p.get("archived", 0)),
+                 p.get("archived", 0), p.get("barcode", "")),
             )
 
         for u in data.get("users", []):
@@ -1300,6 +1386,27 @@ class BlazeBiteApp(ctk.CTk):
                                  command=self._clear_search)
         clear_btn.pack(side="left", padx=2, pady=8)
 
+        # ── Barcode scanner input ──
+        barcode_sep = ctk.CTkLabel(search_frame, text="│",
+                                   font=ctk.CTkFont("Helvetica", 16),
+                                   text_color=COLORS["border"])
+        barcode_sep.pack(side="left", padx=(8, 4), pady=8)
+
+        barcode_icon = ctk.CTkLabel(search_frame, text="📦 Scan:",
+                                    font=ctk.CTkFont("Helvetica", 11),
+                                    text_color=COLORS["gold"])
+        barcode_icon.pack(side="left", padx=(4, 4), pady=8)
+
+        self.barcode_var = ctk.StringVar()
+        self.barcode_entry = ctk.CTkEntry(search_frame, textvariable=self.barcode_var,
+                                          width=160, height=36, corner_radius=8,
+                                          fg_color=COLORS["bg_hover"],
+                                          border_color=COLORS["gold"],
+                                          placeholder_text="Scan barcode...",
+                                          font=ctk.CTkFont("Helvetica", 11))
+        self.barcode_entry.pack(side="left", padx=4, pady=8)
+        self.barcode_entry.bind("<Return>", lambda _: self._on_barcode_scan())
+
         # Category tab bar
         self.cat_bar = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"],
                                corner_radius=0, height=56, border_width=1,
@@ -1370,9 +1477,10 @@ class BlazeBiteApp(ctk.CTk):
         self.menu_data = self._load_menu()
         self._refresh_category_buttons()
 
-        self.active_category = next(iter(self.menu_data.keys()), None)
-        if self.active_category:
-            self._select_category(self.active_category)
+        self.active_category = None  # Reset so _select_category renders
+        first_cat = next(iter(self.menu_data.keys()), None)
+        if first_cat:
+            self._select_category(first_cat)
 
         # Reset order for new store
         self._clear_order()
@@ -1454,6 +1562,39 @@ class BlazeBiteApp(ctk.CTk):
         # Show the active category
         if self.active_category:
             self._render_category(self.active_category)
+
+    def _on_barcode_scan(self):
+        """Handle barcode scanner input — look up product and add to cart."""
+        barcode = self.barcode_var.get().strip()
+        if not barcode:
+            return
+
+        row = self.db.find_product_by_barcode(barcode, store=self.active_store)
+        if row:
+            item = {
+                'id': row[0],
+                'category': row[1],
+                'name': row[2],
+                'price': row[3],
+                'desc': row[4] or '',
+                'quantity': row[5] if len(row) > 5 else 0,
+                'store': row[6] if len(row) > 6 else self.active_store,
+                'barcode': row[8] if len(row) > 8 else '',
+            }
+            self._add_item(item)
+            # Flash success feedback
+            self.barcode_entry.configure(border_color=COLORS["success"])
+            self.after(600, lambda: self.barcode_entry.configure(border_color=COLORS["gold"]))
+        else:
+            # Not found — flash red
+            self.barcode_entry.configure(border_color=COLORS["error"])
+            self.after(1000, lambda: self.barcode_entry.configure(border_color=COLORS["gold"]))
+            messagebox.showwarning("Barcode Not Found",
+                                   f"No product with barcode '{barcode}' in this store.")
+
+        # Clear the barcode field and re-focus for next scan
+        self.barcode_var.set("")
+        self.barcode_entry.focus_set()
 
     def _make_item_card(self, parent, item: dict, row: int, col: int):
         # Use grid layout for better performance than pack
@@ -2624,6 +2765,78 @@ class BlazeBiteApp(ctk.CTk):
             command=lambda: self._set_selected_system_item_archive(self.root_items_tree, False),
         ).pack(side="left")
 
+        # ─── Category Management ──────────────────────────────
+        cat_section = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_card"], corner_radius=10,
+                                   border_width=1, border_color=COLORS["border"])
+        cat_section.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+        cat_header = ctk.CTkFrame(cat_section, fg_color="transparent")
+        cat_header.pack(fill="x", padx=12, pady=(10, 6))
+
+        ctk.CTkLabel(cat_header, text="📂  Product Categories",
+                     font=ctk.CTkFont("Helvetica", 15, "bold"),
+                     text_color=COLORS["text_primary"]).pack(side="left")
+
+        ctk.CTkButton(
+            cat_header, text="+ Add Category", width=130, height=30,
+            fg_color=COLORS["success"], hover_color="#059669",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._open_add_category_dialog,
+        ).pack(side="right", padx=(8, 0))
+
+        cat_filter_row = ctk.CTkFrame(cat_section, fg_color="transparent")
+        cat_filter_row.pack(fill="x", padx=8, pady=(0, 4))
+
+        ctk.CTkLabel(cat_filter_row, text="Store:",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(4, 8))
+
+        self.root_cat_store_var = tk.StringVar(value="All")
+        ctk.CTkComboBox(
+            cat_filter_row, width=150, height=30,
+            values=["All", "Fast Food", "Cold Store"],
+            variable=self.root_cat_store_var,
+            command=lambda _v: self._refresh_root_categories(),
+            fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 11),
+        ).pack(side="left")
+
+        cat_cols = ("ID", "Store", "Category Name", "Sort Order")
+        self.root_cat_tree = ttk.Treeview(cat_section, columns=cat_cols,
+                                          show="headings", height=8,
+                                          style="Custom.Treeview")
+        for col, width in zip(cat_cols, [60, 120, 300, 100]):
+            self.root_cat_tree.heading(col, text=col)
+            self.root_cat_tree.column(col, width=width, anchor="center" if col != "Category Name" else "w")
+
+        cat_tree_scroll = ttk.Scrollbar(cat_section, orient="vertical", command=self.root_cat_tree.yview)
+        self.root_cat_tree.configure(yscrollcommand=cat_tree_scroll.set)
+        cat_tree_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        self.root_cat_tree.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        cat_actions = ctk.CTkFrame(cat_section, fg_color="transparent")
+        cat_actions.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkButton(
+            cat_actions, text="Edit Selected", height=30, width=120,
+            fg_color=COLORS["warning"], hover_color="#D97706",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._open_edit_category_dialog,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            cat_actions, text="Delete Selected", height=30, width=120,
+            fg_color=COLORS["error"], hover_color="#DC2626",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._delete_selected_category,
+        ).pack(side="left")
+
         # Activity log section
         log_section = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_card"], corner_radius=10,
                                    border_width=1, border_color=COLORS["border"])
@@ -2792,6 +3005,9 @@ class BlazeBiteApp(ctk.CTk):
                 self.root_items_tree,
                 self.root_items_store_var.get() if hasattr(self, "root_items_store_var") else "All",
             )
+
+        if hasattr(self, "root_cat_tree"):
+            self._refresh_root_categories()
 
         if hasattr(self, "_sync_status_lbl"):
             self._update_sync_status()
@@ -3194,6 +3410,223 @@ class BlazeBiteApp(ctk.CTk):
         if hasattr(self, "root_items_tree") and hasattr(self, "root_items_store_var"):
             self._populate_system_items_tree(self.root_items_tree, self.root_items_store_var.get())
 
+    # ─── Category Management Handlers ──────────────────────────
+    def _refresh_root_categories(self):
+        if not hasattr(self, "root_cat_tree"):
+            return
+        for row in self.root_cat_tree.get_children():
+            self.root_cat_tree.delete(row)
+
+        store_map = {"All": None, "Fast Food": "fast_food", "Cold Store": "cold_store"}
+        selected_store = store_map.get(
+            self.root_cat_store_var.get() if hasattr(self, "root_cat_store_var") else "All",
+            None,
+        )
+        for cat_id, store, name, sort_order in self.db.get_categories(store=selected_store):
+            store_label = STORE_LABELS.get(store, store)
+            self.root_cat_tree.insert("", "end", iid=str(cat_id),
+                                      values=(cat_id, store_label, name, sort_order))
+
+    def _open_add_category_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add Category")
+        dialog.geometry("400x280")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        ctk.CTkLabel(dialog, text="Store:",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_primary"]).pack(pady=(16, 4))
+        store_var = tk.StringVar(value="Fast Food")
+        ctk.CTkComboBox(dialog, values=["Fast Food", "Cold Store"],
+                        variable=store_var, width=250,
+                        fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                        text_color=COLORS["text_primary"],
+                        dropdown_fg_color=COLORS["bg_card"],
+                        dropdown_text_color=COLORS["text_primary"]).pack(pady=4)
+
+        ctk.CTkLabel(dialog, text="Category Name:",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_primary"]).pack(pady=(12, 4))
+        name_entry = ctk.CTkEntry(dialog, width=250, placeholder_text="e.g. 🍕 Pizza",
+                                  fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                  text_color=COLORS["text_primary"])
+        name_entry.pack(pady=4)
+
+        ctk.CTkLabel(dialog, text="Sort Order:",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_primary"]).pack(pady=(12, 4))
+        order_entry = ctk.CTkEntry(dialog, width=250, placeholder_text="0",
+                                   fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                   text_color=COLORS["text_primary"])
+        order_entry.insert(0, "0")
+        order_entry.pack(pady=4)
+
+        def save():
+            store_label = store_var.get()
+            store_key = {"Fast Food": "fast_food", "Cold Store": "cold_store"}.get(store_label)
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Category name is required.")
+                return
+            try:
+                sort_order = int(order_entry.get().strip() or "0")
+            except ValueError:
+                messagebox.showerror("Error", "Sort order must be a number.")
+                return
+            existing = self.db.get_category_names(store_key)
+            if name in existing:
+                messagebox.showerror("Error", f"Category '{name}' already exists for {store_label}.")
+                return
+            self.db.add_category(store_key, name, sort_order)
+            self.db.log_activity(
+                self.current_user or "root_admin", self.current_role or "root_admin",
+                "ADD_CATEGORY", name, f"store={store_key}, sort_order={sort_order}",
+                store=store_key,
+            )
+            self._refresh_root_categories()
+            # Refresh menu if this store is currently active
+            if self.active_store == store_key:
+                self.menu_data = self._load_menu()
+                self._refresh_category_buttons()
+                if self.active_category:
+                    self._select_category(self.active_category)
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Category '{name}' added to {store_label}.")
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=12)
+        ctk.CTkButton(btn_frame, text="Save", width=100, fg_color=COLORS["success"],
+                      hover_color="#059669", text_color="white", command=save).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, fg_color=COLORS["bg_hover"],
+                      hover_color=COLORS["border"], text_color=COLORS["text_primary"],
+                      command=dialog.destroy).pack(side="left", padx=5)
+
+    def _open_edit_category_dialog(self):
+        selected = self.root_cat_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Select a category to edit.")
+            return
+
+        cat_id = int(selected[0])
+        values = self.root_cat_tree.item(selected[0], "values")
+        old_store_label = values[1]
+        old_name = values[2]
+        old_sort = values[3]
+
+        store_key = {"Fast Food": "fast_food", "Cold Store": "cold_store"}.get(old_store_label, old_store_label)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Edit Category")
+        dialog.geometry("400x240")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        ctk.CTkLabel(dialog, text=f"Store: {old_store_label}",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(pady=(16, 8))
+
+        ctk.CTkLabel(dialog, text="Category Name:",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_primary"]).pack(pady=(4, 4))
+        name_entry = ctk.CTkEntry(dialog, width=250,
+                                  fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                  text_color=COLORS["text_primary"])
+        name_entry.insert(0, old_name)
+        name_entry.pack(pady=4)
+
+        ctk.CTkLabel(dialog, text="Sort Order:",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_primary"]).pack(pady=(8, 4))
+        order_entry = ctk.CTkEntry(dialog, width=250,
+                                   fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                   text_color=COLORS["text_primary"])
+        order_entry.insert(0, str(old_sort))
+        order_entry.pack(pady=4)
+
+        def save():
+            new_name = name_entry.get().strip()
+            if not new_name:
+                messagebox.showerror("Error", "Category name is required.")
+                return
+            try:
+                sort_order = int(order_entry.get().strip() or "0")
+            except ValueError:
+                messagebox.showerror("Error", "Sort order must be a number.")
+                return
+            # Update category record
+            self.db.update_category(cat_id, new_name, sort_order)
+            # If renamed, update all products in that category
+            if new_name != old_name:
+                self.db.rename_category_in_products(store_key, old_name, new_name)
+            self.db.log_activity(
+                self.current_user or "root_admin", self.current_role or "root_admin",
+                "EDIT_CATEGORY", new_name,
+                f"old_name={old_name}, sort_order={sort_order}, store={store_key}",
+                store=store_key,
+            )
+            self._refresh_root_categories()
+            if hasattr(self, "root_items_tree"):
+                self._populate_system_items_tree(
+                    self.root_items_tree,
+                    self.root_items_store_var.get() if hasattr(self, "root_items_store_var") else "All",
+                )
+            if self.active_store == store_key:
+                self.menu_data = self._load_menu()
+                self._refresh_category_buttons()
+                if self.active_category:
+                    self._select_category(self.active_category)
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Category updated to '{new_name}'.")
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=12)
+        ctk.CTkButton(btn_frame, text="Save", width=100, fg_color=COLORS["success"],
+                      hover_color="#059669", text_color="white", command=save).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, fg_color=COLORS["bg_hover"],
+                      hover_color=COLORS["border"], text_color=COLORS["text_primary"],
+                      command=dialog.destroy).pack(side="left", padx=5)
+
+    def _delete_selected_category(self):
+        selected = self.root_cat_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Select a category to delete.")
+            return
+
+        cat_id = int(selected[0])
+        values = self.root_cat_tree.item(selected[0], "values")
+        cat_name = values[2]
+        store_label = values[1]
+        store_key = {"Fast Food": "fast_food", "Cold Store": "cold_store"}.get(store_label, store_label)
+
+        # Check if products exist in this category
+        products = self.db.get_all_products(store=store_key, include_archived=True)
+        products_in_cat = [p for p in products if p[1] == cat_name]
+
+        if products_in_cat:
+            messagebox.showerror(
+                "Cannot Delete",
+                f"Category '{cat_name}' has {len(products_in_cat)} product(s).\n"
+                "Remove or reassign them first.",
+            )
+            return
+
+        if not messagebox.askyesno("Confirm Delete", f"Delete category '{cat_name}' from {store_label}?"):
+            return
+
+        self.db.delete_category(cat_id)
+        self.db.log_activity(
+            self.current_user or "root_admin", self.current_role or "root_admin",
+            "DELETE_CATEGORY", cat_name, f"store={store_key}",
+            store=store_key,
+        )
+        self._refresh_root_categories()
+        if self.active_store == store_key:
+            self.menu_data = self._load_menu()
+            self._refresh_category_buttons()
+
     def _set_selected_system_item_archive(self, tree_widget, archive: bool):
         if self.current_role not in ("admin", "root_admin"):
             messagebox.showerror("Access Denied", "Only admin accounts can archive/unarchive products.")
@@ -3289,8 +3722,14 @@ class BlazeBiteApp(ctk.CTk):
         if not self.active_store:
             return {}
         products = self.db.get_all_products(store=self.active_store)
+
+        # Build category list from DB categories first, then fall back to hardcoded STORE_MENUS
+        db_cats = self.db.get_category_names(self.active_store)
         base_menu = STORE_MENUS.get(self.active_store, {})
-        menu = {cat: [] for cat in base_menu}
+        if db_cats:
+            menu = {cat: [] for cat in db_cats}
+        else:
+            menu = {cat: [] for cat in base_menu}
 
         # Map database categories to the UI categories (e.g., "Pastries" -> "🍔 Pastries")
         def find_category_key(db_cat: str) -> str | None:
@@ -3303,7 +3742,7 @@ class BlazeBiteApp(ctk.CTk):
             return None
 
         for row in products:
-            # row: id, category, name, price, desc, quantity, store, archived
+            # row: id, category, name, price, desc, quantity, store, archived, barcode
             cat = row[1]
             key = find_category_key(cat)
             item = {
@@ -3315,6 +3754,7 @@ class BlazeBiteApp(ctk.CTk):
                 'quantity': row[5] if len(row) > 5 else 0,
                 'store': row[6] if len(row) > 6 else self.active_store,
                 'archived': bool(row[7]) if len(row) > 7 else False,
+                'barcode': row[8] if len(row) > 8 else '',
             }
             if key:
                 menu[key].append(item)
@@ -3647,6 +4087,11 @@ class BlazeBiteApp(ctk.CTk):
                 # Name
                 name_label = ctk.CTkLabel(item_frame, text=item['name'], font=ctk.CTkFont("Helvetica", 12, "bold"), text_color=COLORS["text_primary"])
                 name_label.pack(side="left", padx=12, pady=10)
+                # Barcode badge
+                item_barcode = item.get('barcode', '')
+                if item_barcode:
+                    bc_label = ctk.CTkLabel(item_frame, text=f"⊟ {item_barcode}", font=ctk.CTkFont("Helvetica", 10), text_color=COLORS["gold"])
+                    bc_label.pack(side="left", padx=4, pady=10)
                 # Stock quantity badge
                 qty = item.get('quantity', 0)
                 qty_color = COLORS["success"] if qty > 0 else COLORS["error"]
@@ -3671,7 +4116,7 @@ class BlazeBiteApp(ctk.CTk):
                 self.product_frames.append((item_frame, price_var))
 
     def _update_product_price(self, item, price_var):
-        if self.current_role != "admin":
+        if self.current_role not in ("admin", "root_admin"):
             messagebox.showerror("Access Denied", "Only admin accounts can edit item prices.")
             return
         try:
@@ -3679,7 +4124,8 @@ class BlazeBiteApp(ctk.CTk):
             new_price = float(price_var.get())
             store = item.get('store', self.active_store)
             qty = int(item.get('quantity', 0) or 0)
-            self.db.update_product(item['id'], item['category'], item['name'], new_price, item['desc'], qty, store)
+            barcode = item.get('barcode', '')
+            self.db.update_product(item['id'], item['category'], item['name'], new_price, item['desc'], qty, store, barcode)
             self.menu_data = self._load_menu()
             self.db.log_activity(
                 self.current_user or "unknown",
@@ -3695,7 +4141,7 @@ class BlazeBiteApp(ctk.CTk):
             messagebox.showerror("Error", "Invalid price")
 
     def _archive_product(self, item):
-        if self.current_role != "admin":
+        if self.current_role not in ("admin", "root_admin"):
             messagebox.showerror("Access Denied", "Only admin accounts can archive products.")
             return
 
@@ -4087,29 +4533,29 @@ class BlazeBiteApp(ctk.CTk):
         self._product_dialog()
 
     def _edit_product(self, product):
-        if self.current_role != "admin":
+        if self.current_role not in ("admin", "root_admin"):
             messagebox.showerror("Access Denied", "Only admin accounts can edit products.")
             return
         self._product_dialog(product)
 
     def _product_dialog(self, product=None):
-        if self.current_role != "admin":
+        if self.current_role not in ("admin", "root_admin"):
             messagebox.showerror("Access Denied", "Only admin accounts can modify products.")
             return
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Product" if product is None else "Edit Product")
-        dialog.geometry("420x440")
+        dialog.geometry("420x520")
         dialog.transient(self)
         dialog.grab_set()
         dialog.configure(fg_color=COLORS["bg_dark"])
 
         # Determine which store this product belongs to (fast food or cold store)
         store = product.get('store', self.active_store) if product else self.active_store
-        store_menu = STORE_MENUS.get(store, {})
 
-        # Category
+        # Category - prefer DB categories, fall back to STORE_MENUS
         ctk.CTkLabel(dialog, text="Category:").pack(pady=5)
-        cat_values = list(store_menu.keys())
+        db_cats = self.db.get_category_names(store) if store else []
+        cat_values = db_cats if db_cats else list(STORE_MENUS.get(store, {}).keys())
         cat_var = ctk.StringVar(value=product['category'] if product else (cat_values[0] if cat_values else ""))
         cat_combo = ctk.CTkComboBox(dialog, values=cat_values, variable=cat_var)
         cat_combo.pack(pady=5)
@@ -4144,6 +4590,13 @@ class BlazeBiteApp(ctk.CTk):
         if product:
             desc_entry.insert(0, product.get('desc', ''))
 
+        # Barcode
+        ctk.CTkLabel(dialog, text="Barcode (scan or type):").pack(pady=5)
+        barcode_entry = ctk.CTkEntry(dialog, placeholder_text="Scan barcode here...")
+        barcode_entry.pack(pady=5)
+        if product:
+            barcode_entry.insert(0, product.get('barcode', ''))
+
         # Buttons
         def save():
             try:
@@ -4152,18 +4605,24 @@ class BlazeBiteApp(ctk.CTk):
                 price = float(price_entry.get())
                 quantity = int(qty_entry.get().strip() or "0")
                 desc = desc_entry.get().strip()
+                barcode = barcode_entry.get().strip()
                 if not name:
                     raise ValueError("Name required")
                 if quantity < 0:
                     raise ValueError("Quantity cannot be negative")
+                # Validate barcode uniqueness
+                if barcode:
+                    existing = self.db.find_product_by_barcode(barcode)
+                    if existing and (not product or existing[0] != product['id']):
+                        raise ValueError(f"Barcode '{barcode}' is already assigned to another product.")
                 if product:
                     action = "EDIT_PRODUCT"
                     target = product['name']
-                    self.db.update_product(product['id'], cat, name, price, desc, quantity, store)
+                    self.db.update_product(product['id'], cat, name, price, desc, quantity, store, barcode)
                 else:
                     action = "ADD_PRODUCT"
                     target = name
-                    self.db.add_product(cat, name, price, desc, quantity, store)
+                    self.db.add_product(cat, name, price, desc, quantity, store, barcode)
                 self.menu_data = self._load_menu()
                 self.db.log_activity(
                     self.current_user or "unknown",
@@ -4262,13 +4721,14 @@ class BlazeBiteApp(ctk.CTk):
             self.root_logged_in  = (user_role == "root_admin")
             self.menu_data       = self._load_menu()
             self.order_counter   = self._get_next_order_number()
-            self.active_category = next(iter(self.menu_data.keys()), None)
+            first_cat = next(iter(self.menu_data.keys()), None)
+            self.active_category = None  # Reset so _select_category renders
             self.db.log_activity(user_name, user_role, "LOGIN", user_name,
                                  f"store={self.active_store}", store=self.active_store)
             self._apply_role_permissions()
             self._refresh_category_buttons()
-            if self.active_category:
-                self._select_category(self.active_category)
+            if first_cat:
+                self._select_category(first_cat)
             self._refresh_order_panel()
             self.order_badge.configure(text=f"Order  # {self.order_counter:04d}")
             if user_role == "root_admin":
@@ -4295,81 +4755,33 @@ class BlazeBiteApp(ctk.CTk):
 
         ctk.CTkFrame(brand, fg_color="transparent", height=40).pack()
 
-        # ── NSA Logo (faithful recreation — bold & visible) ──
-        logo_w, logo_h = 280, 200
-        logo_canvas = tk.Canvas(brand, width=logo_w, height=logo_h,
-                                bg=COLORS["bg_panel"], highlightthickness=0, bd=0)
-        logo_canvas.pack(pady=(0, 0))
-        cx, cy_circle = logo_w // 2, 68
+        # ── NSA Logo — Official Image ──
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nsa_logo.png")
+        try:
+            pil_img = PILImage.open(logo_path).convert("RGBA")
+            # Resize to fit the brand panel (max width 260, preserve aspect)
+            max_w = 260
+            ratio = max_w / pil_img.width
+            new_h = int(pil_img.height * ratio)
+            pil_img = pil_img.resize((max_w, new_h), PILImage.LANCZOS)
+            # Composite onto the panel background colour so transparency works
+            bg_rgb = tuple(int(COLORS["bg_panel"].lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+            bg_layer = PILImage.new("RGBA", pil_img.size, bg_rgb + (255,))
+            bg_layer.paste(pil_img, (0, 0), pil_img)
+            final_img = bg_layer.convert("RGB")
+            self._login_logo_tk = ImageTk.PhotoImage(final_img)
+            logo_label = tk.Label(brand, image=self._login_logo_tk,
+                                  bg=COLORS["bg_panel"], bd=0)
+            logo_label.pack(pady=(0, 0))
+        except Exception:
+            # Fallback: simple text badge if image not found
+            ctk.CTkLabel(brand, text="NSA",
+                         font=ctk.CTkFont("Helvetica", 48, "bold"),
+                         text_color=COLORS["accent_glow"]).pack(pady=(20, 0))
 
-        # Ghana flag colors
-        GH_RED = "#CE1126"
-        GH_GOLD = "#FCD116"
-        GH_GREEN = "#006B3F"
-        GH_BLACK = "#111111"
-
-        # ── Wing / banner shape (behind the circle) ──
-        wing_y = cy_circle + 6
-        # Red band (top)
-        logo_canvas.create_polygon(
-            cx - 130, wing_y - 22,  cx - 54, wing_y - 22,
-            cx - 48, wing_y - 10,   cx + 48, wing_y - 10,
-            cx + 54, wing_y - 22,   cx + 130, wing_y - 22,
-            cx + 115, wing_y - 6,   cx + 56, wing_y - 3,
-            cx - 56, wing_y - 3,    cx - 115, wing_y - 6,
-            fill=GH_RED, outline="", smooth=False
-        )
-        # Gold/yellow band (middle)
-        logo_canvas.create_polygon(
-            cx - 115, wing_y - 6,   cx - 56, wing_y - 3,
-            cx - 54, wing_y + 12,   cx + 54, wing_y + 12,
-            cx + 56, wing_y - 3,    cx + 115, wing_y - 6,
-            cx + 98, wing_y + 12,   cx + 56, wing_y + 16,
-            cx - 56, wing_y + 16,   cx - 98, wing_y + 12,
-            fill=GH_GOLD, outline="", smooth=False
-        )
-        # Green band (bottom)
-        logo_canvas.create_polygon(
-            cx - 98, wing_y + 12,   cx - 56, wing_y + 16,
-            cx - 50, wing_y + 36,   cx + 50, wing_y + 36,
-            cx + 56, wing_y + 16,   cx + 98, wing_y + 12,
-            cx + 78, wing_y + 36,   cx + 50, wing_y + 42,
-            cx - 50, wing_y + 42,   cx - 78, wing_y + 36,
-            fill=GH_GREEN, outline="", smooth=False
-        )
-
-        # ── Black circle (central emblem) ──
-        r = 48
-        logo_canvas.create_oval(cx - r, cy_circle - r, cx + r, cy_circle + r,
-                                fill=GH_BLACK, outline="#444444", width=2)
-
-        # ── Stylised figure (ü shape) inside circle ──
-        # Two dots
-        logo_canvas.create_oval(cx - 14, cy_circle - 28, cx - 6, cy_circle - 20,
-                                fill="white", outline="")
-        logo_canvas.create_oval(cx + 6, cy_circle - 28, cx + 14, cy_circle - 20,
-                                fill="white", outline="")
-        # U-shape body
-        logo_canvas.create_arc(cx - 16, cy_circle - 16, cx + 16, cy_circle + 12,
-                               start=180, extent=180, style="arc",
-                               outline="white", width=3.5)
-        logo_canvas.create_line(cx - 16, cy_circle - 2, cx - 16, cy_circle - 14,
-                                fill="white", width=3.5)
-        logo_canvas.create_line(cx + 16, cy_circle - 2, cx + 16, cy_circle - 14,
-                                fill="white", width=3.5)
-
-        # "NSA" text inside circle
-        logo_canvas.create_text(cx, cy_circle + 26, text="NSA", fill="white",
-                                font=("Helvetica", 18, "bold"))
-
-        # ── "SERVICE TO THE NATION" on gold/green band ──
-        logo_canvas.create_text(cx, wing_y + 28, text="SERVICE TO THE NATION",
-                                fill=GH_GOLD, font=("Helvetica", 9, "bold"))
-
-        # ── "NATIONAL SERVICE AUTHORITY" below ──
-        logo_canvas.create_text(cx, logo_h - 10, text="NATIONAL  SERVICE  AUTHORITY",
-                                fill=COLORS["text_primary"],
-                                font=("Helvetica", 12, "bold"))
+        ctk.CTkLabel(brand, text="NATIONAL  SERVICE  AUTHORITY",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_primary"]).pack(pady=(4, 0))
 
         ctk.CTkLabel(brand, text=APP_NAME,
                      font=ctk.CTkFont("Helvetica", 22, "bold"),
