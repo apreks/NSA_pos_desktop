@@ -16,6 +16,8 @@ import ctypes
 from ctypes import wintypes
 from tkinter import messagebox, ttk
 import tkinter as tk
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 # ─────────────────────────────────────────────
 #  APP DATA DIRECTORY SETUP
@@ -512,6 +514,271 @@ class Database:
         # Global root-admin account for system-wide operations
         self.add_or_update_user("system", "root_admin", "root_admin", "root123", create_if_missing=True)
 
+    # ── Data Export / Import ────────────────────────────────────
+    def export_all_data(self) -> dict:
+        """Export entire database to a dict suitable for JSON serialization."""
+        data = {
+            "export_date": datetime.datetime.now().isoformat(),
+            "app_version": "1.0",
+            "transactions": [],
+            "products": [],
+            "users": [],
+            "activities": [],
+        }
+        for row in self.conn.execute("SELECT * FROM transactions ORDER BY id").fetchall():
+            data["transactions"].append({
+                "id": row[0], "date": row[1], "time": row[2],
+                "items_json": row[3], "subtotal": row[4], "tax": row[5],
+                "total": row[6], "payment_method": row[7], "order_number": row[8],
+                "store": row[9] if len(row) > 9 else "fast_food",
+            })
+        for row in self.conn.execute("SELECT * FROM products ORDER BY id").fetchall():
+            data["products"].append({
+                "id": row[0], "category": row[1], "name": row[2],
+                "price": row[3], "desc": row[4],
+                "quantity": row[5] if len(row) > 5 else 0,
+                "store": row[6] if len(row) > 6 else "fast_food",
+                "archived": row[7] if len(row) > 7 else 0,
+            })
+        for row in self.conn.execute("SELECT * FROM users ORDER BY id").fetchall():
+            data["users"].append({
+                "id": row[0], "store": row[1], "role": row[2],
+                "username": row[3], "password": row[4],
+                "disabled": row[5] if len(row) > 5 else 0,
+            })
+        for row in self.conn.execute("SELECT * FROM activities ORDER BY id").fetchall():
+            data["activities"].append({
+                "id": row[0], "timestamp": row[1], "actor_username": row[2],
+                "actor_role": row[3], "action": row[4], "target": row[5],
+                "details": row[6], "store": row[7] if len(row) > 7 else "system",
+            })
+        return data
+
+    def import_data(self, data: dict, merge: bool = True):
+        """Import data from a previously exported dict.
+
+        If *merge* is True, existing rows (by id) are skipped and only new
+        rows are inserted.  If False, the tables are cleared first.
+        """
+        if not merge:
+            for tbl in ("transactions", "products", "users", "activities"):
+                self.conn.execute(f"DELETE FROM {tbl}")
+
+        for tx in data.get("transactions", []):
+            if merge:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM transactions WHERE id=?", (tx["id"],)
+                ).fetchone()
+                if exists:
+                    continue
+            self.conn.execute(
+                """INSERT INTO transactions
+                   (id, date, time, items_json, subtotal, tax, total, payment_method, order_number, store)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (tx["id"], tx["date"], tx["time"], tx["items_json"],
+                 tx["subtotal"], tx["tax"], tx["total"], tx["payment_method"],
+                 tx["order_number"], tx.get("store", "fast_food")),
+            )
+
+        for p in data.get("products", []):
+            if merge:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM products WHERE id=?", (p["id"],)
+                ).fetchone()
+                if exists:
+                    continue
+            self.conn.execute(
+                """INSERT INTO products
+                   (id, category, name, price, desc, quantity, store, archived)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (p["id"], p["category"], p["name"], p["price"], p["desc"],
+                 p.get("quantity", 0), p.get("store", "fast_food"),
+                 p.get("archived", 0)),
+            )
+
+        for u in data.get("users", []):
+            if merge:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM users WHERE id=?", (u["id"],)
+                ).fetchone()
+                if exists:
+                    continue
+            self.conn.execute(
+                """INSERT INTO users
+                   (id, store, role, username, password, disabled)
+                   VALUES (?,?,?,?,?,?)""",
+                (u["id"], u["store"], u["role"], u["username"],
+                 u["password"], u.get("disabled", 0)),
+            )
+
+        for a in data.get("activities", []):
+            if merge:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM activities WHERE id=?", (a["id"],)
+                ).fetchone()
+                if exists:
+                    continue
+            self.conn.execute(
+                """INSERT INTO activities
+                   (id, timestamp, actor_username, actor_role, action, target, details, store)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (a["id"], a["timestamp"], a["actor_username"], a["actor_role"],
+                 a["action"], a["target"], a["details"], a.get("store", "system")),
+            )
+
+        self.conn.commit()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CLOUD SYNC MANAGER  (local-first, sync on demand)
+# ══════════════════════════════════════════════════════════════════
+BACKUP_DIR = os.path.join(get_app_data_dir(), "backups")
+SYNC_SETTINGS_FILE = os.path.join(get_app_data_dir(), "sync_settings.json")
+
+class CloudSync:
+    """Handles local backups and optional sync to a cloud-synced folder.
+
+    The cloud folder is simply a local directory that is synced by a
+    third-party service (OneDrive, Google Drive, Dropbox, etc.).
+    The app never makes internet calls itself.
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+        self._ensure_dirs()
+        self.settings = self._load_settings()
+
+    @staticmethod
+    def _ensure_dirs():
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    @staticmethod
+    def _load_settings() -> dict:
+        defaults = {
+            "cloud_folder": "",
+            "auto_backup_on_exit": False,
+            "last_backup": "",
+            "last_cloud_sync": "",
+        }
+        try:
+            if os.path.exists(SYNC_SETTINGS_FILE):
+                with open(SYNC_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                defaults.update(saved)
+        except Exception:
+            pass
+        return defaults
+
+    def save_settings(self):
+        try:
+            with open(SYNC_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception:
+            pass
+
+    # ── Local backup ────────────────────────────────────────────
+    def create_backup(self) -> str:
+        """Export DB to a timestamped JSON file in the local backup dir.
+        Returns the path to the backup file."""
+        data = self.db.export_all_data()
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"blazebite_backup_{ts}.json"
+        path = os.path.join(BACKUP_DIR, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        self.settings["last_backup"] = datetime.datetime.now().isoformat()
+        self.save_settings()
+        return path
+
+    def list_backups(self) -> list[str]:
+        """Return list of backup file paths, newest first."""
+        files = [
+            os.path.join(BACKUP_DIR, f)
+            for f in os.listdir(BACKUP_DIR)
+            if f.endswith(".json") and f.startswith("blazebite_backup_")
+        ]
+        files.sort(key=os.path.getmtime, reverse=True)
+        return files
+
+    def restore_backup(self, path: str, merge: bool = True):
+        """Restore database from a JSON backup file."""
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.db.import_data(data, merge=merge)
+
+    def cleanup_old_backups(self, keep: int = 10):
+        """Remove oldest backups, keeping the most recent *keep* files."""
+        backups = self.list_backups()
+        for old in backups[keep:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
+    # ── Cloud folder sync ───────────────────────────────────────
+    def set_cloud_folder(self, path: str):
+        self.settings["cloud_folder"] = path
+        self.save_settings()
+
+    def get_cloud_folder(self) -> str:
+        return self.settings.get("cloud_folder", "")
+
+    def is_cloud_configured(self) -> bool:
+        folder = self.get_cloud_folder()
+        return bool(folder) and os.path.isdir(folder)
+
+    def sync_to_cloud(self) -> str:
+        """Copy the latest local backup to the configured cloud folder.
+        Creates a new backup first if none exists.
+        Returns the destination path."""
+        if not self.is_cloud_configured():
+            raise FileNotFoundError("Cloud folder is not configured or does not exist.")
+
+        backups = self.list_backups()
+        if not backups:
+            src = self.create_backup()
+        else:
+            src = backups[0]
+
+        import shutil
+        dest_dir = os.path.join(self.get_cloud_folder(), "BlazeBite_Backups")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(src))
+        shutil.copy2(src, dest)
+
+        self.settings["last_cloud_sync"] = datetime.datetime.now().isoformat()
+        self.save_settings()
+        return dest
+
+    def sync_from_cloud(self) -> list[str]:
+        """Copy any backup files from cloud folder into local backups.
+        Returns list of newly imported file paths."""
+        if not self.is_cloud_configured():
+            raise FileNotFoundError("Cloud folder is not configured or does not exist.")
+
+        import shutil
+        cloud_backup_dir = os.path.join(self.get_cloud_folder(), "BlazeBite_Backups")
+        if not os.path.isdir(cloud_backup_dir):
+            return []
+
+        imported = []
+        for fname in os.listdir(cloud_backup_dir):
+            if fname.endswith(".json") and fname.startswith("blazebite_backup_"):
+                local_path = os.path.join(BACKUP_DIR, fname)
+                if not os.path.exists(local_path):
+                    shutil.copy2(os.path.join(cloud_backup_dir, fname), local_path)
+                    imported.append(local_path)
+        return imported
+
+    def check_internet(self) -> bool:
+        """Quick check whether the machine appears to have internet access.
+        Used only for status display – the app never depends on this."""
+        import socket
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=2)
+            return True
+        except OSError:
+            return False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -709,6 +976,12 @@ class BlazeBiteApp(ctk.CTk):
         self.receipt_paper_profile = "Auto"  # Auto | 80mm | 58mm
         self._load_app_settings()
 
+        # ── Cloud sync (local-first, sync on demand) ──
+        self.cloud_sync = CloudSync(self.db)
+
+        # Auto-backup on close if enabled
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
+
         # ── Build UI ──
         self._build_layout()
 
@@ -742,6 +1015,16 @@ class BlazeBiteApp(ctk.CTk):
                 json.dump(data, f, indent=2)
         except Exception:
             pass
+
+    def _on_app_close(self):
+        """Handle window close – auto-backup if enabled, then exit."""
+        try:
+            if self.cloud_sync.settings.get("auto_backup_on_exit", False):
+                self.cloud_sync.create_backup()
+                self.cloud_sync.cleanup_old_backups(keep=10)
+        except Exception:
+            pass
+        self.destroy()
 
     def _on_receipt_profile_changed(self, value: str | None = None):
         selected = (value or "").strip()
@@ -1719,6 +2002,27 @@ class BlazeBiteApp(ctk.CTk):
 
         return "\n".join(lines)
 
+    def _save_invoice_pdf(self, invoice_text: str, output_path: str):
+        """Render invoice text to a simple PDF file."""
+        page_w, page_h = A4
+        margin = 36
+        line_height = 12
+
+        pdf = canvas.Canvas(output_path, pagesize=A4)
+        pdf.setTitle(f"Invoice #{self.order_counter:04d}")
+        pdf.setFont("Courier", 10)
+
+        y = page_h - margin
+        for line in invoice_text.splitlines():
+            if y < margin:
+                pdf.showPage()
+                pdf.setFont("Courier", 10)
+                y = page_h - margin
+            pdf.drawString(margin, y, line)
+            y -= line_height
+
+        pdf.save()
+
     def _show_invoice_window(self, invoice: str):
         printer_name = self._get_default_printer_name()
         active_profile = self._get_receipt_profile(printer_name)
@@ -1753,25 +2057,28 @@ class BlazeBiteApp(ctk.CTk):
         txt.insert("end", invoice)
         txt.configure(state="disabled")
 
-        def send_file_to_printer(file_path: str, printer_name: str | None) -> tuple[bool, str]:
+        def send_file_to_printer(file_path: str, printer_name: str | None,
+                                 raw_text: str | None = None) -> tuple[bool, str]:
             """Try multiple print mechanisms so printing works across typical Windows setups."""
             abs_path = os.path.abspath(file_path)
 
             # Preferred path for thermal printers: RAW spool preserves monospaced layout.
-            if printer_name:
-                try:
-                    raw_text = open(abs_path, "r", encoding="utf-8", errors="ignore").read()
-                except Exception:
-                    raw_text = None
-                if raw_text is not None:
-                    ok_raw, raw_msg = self._send_raw_to_printer(printer_name, raw_text + "\n\n\n")
-                    if ok_raw:
-                        return True, raw_msg
+            if printer_name and raw_text:
+                ok_raw, raw_msg = self._send_raw_to_printer(printer_name, raw_text + "\n\n\n")
+                if ok_raw:
+                    return True, raw_msg
 
             try:
                 os.startfile(abs_path, "print")
                 return True, "Sent to the default printer."
             except Exception as first_error:
+                # Notepad fallback is for text files only.
+                if not abs_path.lower().endswith(".txt"):
+                    printer_msg = f" Default printer: {printer_name}." if printer_name else ""
+                    return False, (
+                        f"Could not send the receipt to the printer.{printer_msg}\n"
+                        f"Primary method error: {first_error}"
+                    )
                 try:
                     subprocess.run(["notepad.exe", "/p", abs_path], check=True, timeout=20)
                     return True, "Sent to printer via Notepad fallback."
@@ -1784,41 +2091,40 @@ class BlazeBiteApp(ctk.CTk):
                     )
 
         def print_invoice():
-            # Save invoice to file and send directly to printer.
+            # Save invoice to PDF file and send directly to printer.
             app_data_dir = get_app_data_dir()
             printer_name = self._get_default_printer_name()
             printable_invoice = invoice
 
-            fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
-            with open(fname, "w", encoding="utf-8") as f:
-                f.write(printable_invoice)
+            fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.pdf")
+            self._save_invoice_pdf(printable_invoice, fname)
 
             if not printer_name:
                 messagebox.showerror(
                     "Printer Not Detected",
                     "No default printer was detected on this system.\n"
                     "Set a default printer in Windows Settings and try again.\n"
-                    f"Receipt was still saved as '{fname}'."
+                    f"Invoice PDF was still saved as '{fname}'."
                 )
                 return
 
-            ok, detail = send_file_to_printer(fname, printer_name)
+            ok, detail = send_file_to_printer(fname, printer_name, raw_text=printable_invoice)
             try:
                 if ok:
                     messagebox.showinfo(
                         "Print Sent",
                         f"Receipt sent to printer '{printer_name}'.\n"
-                        f"File saved as '{fname}'.\n{detail}"
+                        f"Invoice PDF saved as '{fname}'.\n{detail}"
                     )
                 else:
                     messagebox.showerror(
                         "Print Failed",
                         f"Detected printer: '{printer_name}', but printing failed.\n"
                         f"{detail}\n"
-                        f"Receipt saved as '{fname}'."
+                        f"Invoice PDF saved as '{fname}'."
                     )
             except Exception as e:
-                messagebox.showerror("Error", f"Unexpected print error: {str(e)}\nFile saved as '{fname}'")
+                messagebox.showerror("Error", f"Unexpected print error: {str(e)}\nInvoice PDF saved as '{fname}'")
 
         btn_row = ctk.CTkFrame(win, fg_color="transparent")
         btn_row.pack(pady=16)
@@ -2023,6 +2329,36 @@ class BlazeBiteApp(ctk.CTk):
                      font=ctk.CTkFont("Helvetica", 10),
                      text_color=COLORS["text_muted"]).pack(side="left", padx=(10, 0))
 
+        # Data backup (admin-level – create/restore only, no cloud config)
+        backup_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                                    corner_radius=10, border_width=1,
+                                    border_color=COLORS["border"])
+        backup_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(backup_frame, text="💾  Data Backup",
+                     font=ctk.CTkFont("Helvetica", 14, "bold"),
+                     text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(backup_frame,
+                     text="Create local backups of all store data. Cloud sync settings are in Root Admin.",
+                     font=ctk.CTkFont("Helvetica", 10),
+                     text_color=COLORS["text_muted"]).pack(anchor="w", padx=12, pady=(0, 6))
+
+        admin_bk_row = ctk.CTkFrame(backup_frame, fg_color="transparent")
+        admin_bk_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkButton(admin_bk_row, text="📦 Create Backup", width=140, height=32,
+                      corner_radius=8, fg_color=COLORS["success"],
+                      hover_color="#059669", text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._do_create_backup).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(admin_bk_row, text="📂 Restore Backup…", width=150, height=32,
+                      corner_radius=8, fg_color=COLORS["warning"],
+                      hover_color="#D97706", text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._do_restore_backup).pack(side="left")
+
         # All-system item list (read-only)
         ctk.CTkLabel(admin_scroll, text="🧾  All System Items",
                      font=ctk.CTkFont("Helvetica", 16, "bold"),
@@ -2117,7 +2453,15 @@ class BlazeBiteApp(ctk.CTk):
         logout_btn.pack(pady=(0, 20))
 
     def _build_root_admin_view(self, parent):
-        header = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"], corner_radius=10,
+        root_scroll = ctk.CTkScrollableFrame(
+            parent,
+            fg_color=COLORS["bg_dark"],
+            corner_radius=0,
+            scrollbar_button_color=COLORS["border"],
+        )
+        root_scroll.pack(fill="both", expand=True)
+
+        header = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_panel"], corner_radius=10,
                               border_width=1, border_color=COLORS["border"])
         header.pack(fill="x", padx=16, pady=(16, 10))
 
@@ -2169,7 +2513,7 @@ class BlazeBiteApp(ctk.CTk):
                      text_color=COLORS["text_secondary"]).pack(side="right", padx=(8, 2), pady=10)
 
         # User list section
-        user_section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=10,
+        user_section = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_card"], corner_radius=10,
                                     border_width=1, border_color=COLORS["border"])
         user_section.pack(fill="both", expand=True, padx=16, pady=(0, 10))
 
@@ -2211,7 +2555,7 @@ class BlazeBiteApp(ctk.CTk):
         ).pack(side="left", padx=4)
 
         # All-system item list (read-only)
-        items_section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=10,
+        items_section = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_card"], corner_radius=10,
                                      border_width=1, border_color=COLORS["border"])
         items_section.pack(fill="both", expand=True, padx=16, pady=(0, 10))
 
@@ -2281,7 +2625,7 @@ class BlazeBiteApp(ctk.CTk):
         ).pack(side="left")
 
         # Activity log section
-        log_section = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=10,
+        log_section = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_card"], corner_radius=10,
                                    border_width=1, border_color=COLORS["border"])
         log_section.pack(fill="both", expand=True, padx=16, pady=(0, 14))
 
@@ -2289,10 +2633,10 @@ class BlazeBiteApp(ctk.CTk):
                      font=ctk.CTkFont("Helvetica", 15, "bold"),
                      text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 6))
 
-        log_cols = ("Time", "Actor", "Role", "Action", "Target", "Store")
+        log_cols = ("Time", "Actor", "Role", "Action", "Target", "Details", "Store")
         self.root_log_tree = ttk.Treeview(log_section, columns=log_cols, show="headings", height=10,
                                           style="Custom.Treeview")
-        for col, width in zip(log_cols, [170, 150, 110, 220, 220, 120]):
+        for col, width in zip(log_cols, [165, 130, 100, 180, 170, 260, 90]):
             self.root_log_tree.heading(col, text=col)
             self.root_log_tree.column(col, width=width, anchor="center")
 
@@ -2301,8 +2645,122 @@ class BlazeBiteApp(ctk.CTk):
         log_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
         self.root_log_tree.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
+        # ─── Data Backup & Cloud Sync ──────────────────────────
+        sync_section = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_card"], corner_radius=10,
+                                    border_width=1, border_color=COLORS["border"])
+        sync_section.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(sync_section, text="💾  Data Backup & Cloud Sync",
+                     font=ctk.CTkFont("Helvetica", 15, "bold"),
+                     text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(sync_section,
+                     text="All data is stored locally. Sync copies backups to your cloud folder (OneDrive / Google Drive / Dropbox).",
+                     font=ctk.CTkFont("Helvetica", 10),
+                     text_color=COLORS["text_muted"]).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Status row
+        status_row = ctk.CTkFrame(sync_section, fg_color="transparent")
+        status_row.pack(fill="x", padx=12, pady=(0, 4))
+
+        self._sync_status_lbl = ctk.CTkLabel(
+            status_row, text="",
+            font=ctk.CTkFont("Helvetica", 10),
+            text_color=COLORS["text_secondary"],
+        )
+        self._sync_status_lbl.pack(side="left")
+
+        self._sync_internet_lbl = ctk.CTkLabel(
+            status_row, text="",
+            font=ctk.CTkFont("Helvetica", 10),
+            text_color=COLORS["text_muted"],
+        )
+        self._sync_internet_lbl.pack(side="right")
+
+        # Cloud folder config row
+        folder_row = ctk.CTkFrame(sync_section, fg_color="transparent")
+        folder_row.pack(fill="x", padx=12, pady=(0, 6))
+
+        ctk.CTkLabel(folder_row, text="Cloud Folder:",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 8))
+
+        self._cloud_folder_var = tk.StringVar(value=self.cloud_sync.get_cloud_folder())
+        self._cloud_folder_entry = ctk.CTkEntry(
+            folder_row, textvariable=self._cloud_folder_var,
+            width=400, height=32, corner_radius=8,
+            fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+            placeholder_text="e.g. C:\\Users\\You\\OneDrive\\POS_Sync",
+            font=ctk.CTkFont("Helvetica", 10),
+        )
+        self._cloud_folder_entry.pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(folder_row, text="Browse…", width=80, height=32,
+                      corner_radius=8, fg_color=COLORS["bg_hover"],
+                      hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      font=ctk.CTkFont("Helvetica", 10),
+                      command=self._browse_cloud_folder).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(folder_row, text="Save", width=60, height=32,
+                      corner_radius=8, fg_color=COLORS["accent"],
+                      hover_color=COLORS["accent_glow"],
+                      text_color="white",
+                      font=ctk.CTkFont("Helvetica", 10, "bold"),
+                      command=self._save_cloud_folder).pack(side="left")
+
+        # Auto-backup checkbox
+        auto_row = ctk.CTkFrame(sync_section, fg_color="transparent")
+        auto_row.pack(fill="x", padx=12, pady=(0, 6))
+
+        self._auto_backup_var = tk.BooleanVar(
+            value=self.cloud_sync.settings.get("auto_backup_on_exit", False)
+        )
+        ctk.CTkCheckBox(
+            auto_row, text="Auto-backup when app closes",
+            variable=self._auto_backup_var,
+            command=self._toggle_auto_backup,
+            font=ctk.CTkFont("Helvetica", 11),
+            text_color=COLORS["text_secondary"],
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_soft"],
+            border_color=COLORS["border"],
+        ).pack(side="left")
+
+        # Action buttons row
+        btn_row = ctk.CTkFrame(sync_section, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(4, 10))
+
+        ctk.CTkButton(btn_row, text="📦 Create Backup", width=140, height=34,
+                      corner_radius=8, fg_color=COLORS["success"],
+                      hover_color="#059669", text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._do_create_backup).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(btn_row, text="📂 Restore Backup…", width=150, height=34,
+                      corner_radius=8, fg_color=COLORS["warning"],
+                      hover_color="#D97706", text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._do_restore_backup).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(btn_row, text="☁️ Sync to Cloud", width=140, height=34,
+                      corner_radius=8, fg_color=COLORS["accent"],
+                      hover_color=COLORS["accent_glow"], text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._do_sync_to_cloud).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(btn_row, text="⬇️ Sync from Cloud", width=150, height=34,
+                      corner_radius=8, fg_color=COLORS["bg_hover"],
+                      hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._do_sync_from_cloud).pack(side="left")
+
+        # Refresh sync status display
+        self._update_sync_status()
+
         ctk.CTkButton(
-            parent,
+            root_scroll,
             text="🚪 Logout Root Admin",
             height=40,
             fg_color=COLORS["error"],
@@ -2327,13 +2785,200 @@ class BlazeBiteApp(ctk.CTk):
             for row in self.root_log_tree.get_children():
                 self.root_log_tree.delete(row)
             for _id, timestamp, actor_username, actor_role, action, target, details, store in self.db.get_activity_logs():
-                self.root_log_tree.insert("", "end", values=(timestamp, actor_username, actor_role, action, target, store))
+                self.root_log_tree.insert("", "end", values=(timestamp, actor_username, actor_role, action, target, details, store))
 
         if hasattr(self, "root_items_tree"):
             self._populate_system_items_tree(
                 self.root_items_tree,
                 self.root_items_store_var.get() if hasattr(self, "root_items_store_var") else "All",
             )
+
+        if hasattr(self, "_sync_status_lbl"):
+            self._update_sync_status()
+
+    # ─── Cloud Sync Handlers ───────────────────────────────────
+    def _update_sync_status(self):
+        """Refresh the sync status labels."""
+        last_bk = self.cloud_sync.settings.get("last_backup", "")
+        last_cs = self.cloud_sync.settings.get("last_cloud_sync", "")
+        parts = []
+        if last_bk:
+            try:
+                dt = datetime.datetime.fromisoformat(last_bk)
+                parts.append(f"Last backup: {dt.strftime('%Y-%m-%d %H:%M')}")
+            except ValueError:
+                parts.append(f"Last backup: {last_bk}")
+        else:
+            parts.append("No backups yet")
+        if last_cs:
+            try:
+                dt = datetime.datetime.fromisoformat(last_cs)
+                parts.append(f"Last cloud sync: {dt.strftime('%Y-%m-%d %H:%M')}")
+            except ValueError:
+                parts.append(f"Last cloud sync: {last_cs}")
+        if hasattr(self, "_sync_status_lbl"):
+            self._sync_status_lbl.configure(text="  |  ".join(parts))
+
+        # Show cloud folder status
+        if hasattr(self, "_sync_internet_lbl"):
+            if self.cloud_sync.is_cloud_configured():
+                self._sync_internet_lbl.configure(
+                    text="☁️ Cloud folder connected",
+                    text_color=COLORS["success"],
+                )
+            else:
+                self._sync_internet_lbl.configure(
+                    text="⚠ No cloud folder configured",
+                    text_color=COLORS["text_muted"],
+                )
+
+    def _browse_cloud_folder(self):
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(
+            title="Select Cloud Sync Folder",
+            initialdir=self._cloud_folder_var.get() or os.path.expanduser("~"),
+        )
+        if folder:
+            self._cloud_folder_var.set(folder)
+
+    def _save_cloud_folder(self):
+        path = self._cloud_folder_var.get().strip()
+        if path and not os.path.isdir(path):
+            messagebox.showerror("Invalid Folder", f"The folder does not exist:\n{path}")
+            return
+        self.cloud_sync.set_cloud_folder(path)
+        self._update_sync_status()
+        messagebox.showinfo("Saved", "Cloud folder path saved." if path else "Cloud folder cleared.")
+
+    def _toggle_auto_backup(self):
+        self.cloud_sync.settings["auto_backup_on_exit"] = self._auto_backup_var.get()
+        self.cloud_sync.save_settings()
+
+    def _do_create_backup(self):
+        try:
+            path = self.cloud_sync.create_backup()
+            self.cloud_sync.cleanup_old_backups(keep=10)
+            self._update_sync_status()
+            self.db.log_activity(
+                self.current_user or "system", self.current_role or "system",
+                "BACKUP_CREATED", os.path.basename(path), "", "system",
+            )
+            messagebox.showinfo("Backup Created", f"Data backed up to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Backup Failed", str(e))
+
+    def _do_restore_backup(self):
+        backups = self.cloud_sync.list_backups()
+        if not backups:
+            messagebox.showinfo("No Backups", "No backup files found.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Restore Backup")
+        dialog.geometry("550x400")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        ctk.CTkLabel(dialog, text="Select a backup to restore:",
+                     font=ctk.CTkFont("Helvetica", 13, "bold"),
+                     text_color=COLORS["text_primary"]).pack(padx=14, pady=(14, 6))
+
+        listbox_frame = ctk.CTkFrame(dialog, fg_color=COLORS["bg_card"], corner_radius=8)
+        listbox_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        lb = tk.Listbox(listbox_frame, bg=COLORS["bg_card"], fg=COLORS["text_primary"],
+                        selectbackground=COLORS["accent"], font=("Helvetica", 10),
+                        borderwidth=0, highlightthickness=0)
+        lb.pack(fill="both", expand=True, padx=4, pady=4)
+
+        for bp in backups:
+            fname = os.path.basename(bp)
+            size_kb = os.path.getsize(bp) / 1024
+            lb.insert(tk.END, f"{fname}  ({size_kb:.1f} KB)")
+
+        merge_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            dialog, text="Merge (keep existing data, add missing)",
+            variable=merge_var,
+            font=ctk.CTkFont("Helvetica", 11),
+            text_color=COLORS["text_secondary"],
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_soft"],
+            border_color=COLORS["border"],
+        ).pack(padx=14, pady=(0, 8))
+
+        def do_restore():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("Select Backup", "Please select a backup file.")
+                return
+            chosen_path = backups[sel[0]]
+            merge = merge_var.get()
+            if not merge:
+                if not messagebox.askyesno(
+                    "Full Restore",
+                    "This will REPLACE all current data with the backup.\nAre you sure?",
+                ):
+                    return
+            try:
+                self.cloud_sync.restore_backup(chosen_path, merge=merge)
+                self.db.log_activity(
+                    self.current_user or "system", self.current_role or "system",
+                    "BACKUP_RESTORED", os.path.basename(chosen_path),
+                    f"merge={merge}", "system",
+                )
+                dialog.destroy()
+                messagebox.showinfo("Restored", "Backup restored successfully.\nRefreshing data…")
+                self._refresh_root_admin()
+            except Exception as e:
+                messagebox.showerror("Restore Failed", str(e))
+
+        ctk.CTkButton(dialog, text="Restore Selected", height=36,
+                      fg_color=COLORS["warning"], hover_color="#D97706",
+                      text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=do_restore).pack(fill="x", padx=14, pady=(0, 14))
+
+        self.wait_window(dialog)
+
+    def _do_sync_to_cloud(self):
+        if not self.cloud_sync.is_cloud_configured():
+            messagebox.showwarning("Not Configured",
+                                   "Set a cloud folder path first (OneDrive, Google Drive, Dropbox folder).")
+            return
+        try:
+            dest = self.cloud_sync.sync_to_cloud()
+            self._update_sync_status()
+            self.db.log_activity(
+                self.current_user or "system", self.current_role or "system",
+                "CLOUD_SYNC_UP", os.path.basename(dest), "", "system",
+            )
+            messagebox.showinfo("Synced to Cloud",
+                                f"Backup copied to cloud folder:\n{dest}\n\n"
+                                "Your cloud service will upload it automatically when online.")
+        except Exception as e:
+            messagebox.showerror("Sync Failed", str(e))
+
+    def _do_sync_from_cloud(self):
+        if not self.cloud_sync.is_cloud_configured():
+            messagebox.showwarning("Not Configured",
+                                   "Set a cloud folder path first.")
+            return
+        try:
+            imported = self.cloud_sync.sync_from_cloud()
+            if imported:
+                self.db.log_activity(
+                    self.current_user or "system", self.current_role or "system",
+                    "CLOUD_SYNC_DOWN", f"{len(imported)} file(s)", "", "system",
+                )
+                messagebox.showinfo("Downloaded from Cloud",
+                                    f"Imported {len(imported)} new backup(s) from cloud.\n"
+                                    "Use 'Restore Backup' to apply one.")
+            else:
+                messagebox.showinfo("Up to Date", "No new backups found in cloud folder.")
+        except Exception as e:
+            messagebox.showerror("Sync Failed", str(e))
 
     def _open_root_add_user_dialog(self):
         if self.current_role != "root_admin":
@@ -3432,6 +4077,10 @@ class BlazeBiteApp(ctk.CTk):
         self.order_items.clear()
         self._refresh_order_panel()
         self._apply_role_permissions()
+        # Hide all views so nothing is accessible behind the login dialog
+        self.pos_view.pack_forget()
+        self.admin_view.pack_forget()
+        self.root_view.pack_forget()
         self._show_login()
 
     def _add_new_product(self):
@@ -3546,6 +4195,12 @@ class BlazeBiteApp(ctk.CTk):
         dialog.focus_force()
         dialog.configure(fg_color=COLORS["bg_dark"])
 
+        # Prevent closing the login dialog without signing in
+        def _on_login_close():
+            if not self.current_user:
+                self.destroy()
+        dialog.protocol("WM_DELETE_WINDOW", _on_login_close)
+
         # Centre on screen
         dialog.update_idletasks()
         sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
@@ -3638,14 +4293,87 @@ class BlazeBiteApp(ctk.CTk):
         ctk.CTkFrame(brand, fg_color=COLORS["accent"], height=5,
                      corner_radius=0).pack(fill="x")
 
-        ctk.CTkFrame(brand, fg_color="transparent", height=64).pack()
+        ctk.CTkFrame(brand, fg_color="transparent", height=40).pack()
 
-        ctk.CTkLabel(brand, text="🍔",
-                     font=ctk.CTkFont("Helvetica", 72)).pack()
+        # ── NSA Logo (faithful recreation — bold & visible) ──
+        logo_w, logo_h = 280, 200
+        logo_canvas = tk.Canvas(brand, width=logo_w, height=logo_h,
+                                bg=COLORS["bg_panel"], highlightthickness=0, bd=0)
+        logo_canvas.pack(pady=(0, 0))
+        cx, cy_circle = logo_w // 2, 68
+
+        # Ghana flag colors
+        GH_RED = "#CE1126"
+        GH_GOLD = "#FCD116"
+        GH_GREEN = "#006B3F"
+        GH_BLACK = "#111111"
+
+        # ── Wing / banner shape (behind the circle) ──
+        wing_y = cy_circle + 6
+        # Red band (top)
+        logo_canvas.create_polygon(
+            cx - 130, wing_y - 22,  cx - 54, wing_y - 22,
+            cx - 48, wing_y - 10,   cx + 48, wing_y - 10,
+            cx + 54, wing_y - 22,   cx + 130, wing_y - 22,
+            cx + 115, wing_y - 6,   cx + 56, wing_y - 3,
+            cx - 56, wing_y - 3,    cx - 115, wing_y - 6,
+            fill=GH_RED, outline="", smooth=False
+        )
+        # Gold/yellow band (middle)
+        logo_canvas.create_polygon(
+            cx - 115, wing_y - 6,   cx - 56, wing_y - 3,
+            cx - 54, wing_y + 12,   cx + 54, wing_y + 12,
+            cx + 56, wing_y - 3,    cx + 115, wing_y - 6,
+            cx + 98, wing_y + 12,   cx + 56, wing_y + 16,
+            cx - 56, wing_y + 16,   cx - 98, wing_y + 12,
+            fill=GH_GOLD, outline="", smooth=False
+        )
+        # Green band (bottom)
+        logo_canvas.create_polygon(
+            cx - 98, wing_y + 12,   cx - 56, wing_y + 16,
+            cx - 50, wing_y + 36,   cx + 50, wing_y + 36,
+            cx + 56, wing_y + 16,   cx + 98, wing_y + 12,
+            cx + 78, wing_y + 36,   cx + 50, wing_y + 42,
+            cx - 50, wing_y + 42,   cx - 78, wing_y + 36,
+            fill=GH_GREEN, outline="", smooth=False
+        )
+
+        # ── Black circle (central emblem) ──
+        r = 48
+        logo_canvas.create_oval(cx - r, cy_circle - r, cx + r, cy_circle + r,
+                                fill=GH_BLACK, outline="#444444", width=2)
+
+        # ── Stylised figure (ü shape) inside circle ──
+        # Two dots
+        logo_canvas.create_oval(cx - 14, cy_circle - 28, cx - 6, cy_circle - 20,
+                                fill="white", outline="")
+        logo_canvas.create_oval(cx + 6, cy_circle - 28, cx + 14, cy_circle - 20,
+                                fill="white", outline="")
+        # U-shape body
+        logo_canvas.create_arc(cx - 16, cy_circle - 16, cx + 16, cy_circle + 12,
+                               start=180, extent=180, style="arc",
+                               outline="white", width=3.5)
+        logo_canvas.create_line(cx - 16, cy_circle - 2, cx - 16, cy_circle - 14,
+                                fill="white", width=3.5)
+        logo_canvas.create_line(cx + 16, cy_circle - 2, cx + 16, cy_circle - 14,
+                                fill="white", width=3.5)
+
+        # "NSA" text inside circle
+        logo_canvas.create_text(cx, cy_circle + 26, text="NSA", fill="white",
+                                font=("Helvetica", 18, "bold"))
+
+        # ── "SERVICE TO THE NATION" on gold/green band ──
+        logo_canvas.create_text(cx, wing_y + 28, text="SERVICE TO THE NATION",
+                                fill=GH_GOLD, font=("Helvetica", 9, "bold"))
+
+        # ── "NATIONAL SERVICE AUTHORITY" below ──
+        logo_canvas.create_text(cx, logo_h - 10, text="NATIONAL  SERVICE  AUTHORITY",
+                                fill=COLORS["text_primary"],
+                                font=("Helvetica", 12, "bold"))
 
         ctk.CTkLabel(brand, text=APP_NAME,
                      font=ctk.CTkFont("Helvetica", 22, "bold"),
-                     text_color=COLORS["accent_glow"]).pack(pady=(10, 2))
+                     text_color=COLORS["accent_glow"]).pack(pady=(12, 2))
 
         ctk.CTkLabel(brand, text="Restaurant  •  Point of Sale",
                      font=ctk.CTkFont("Helvetica", 11),
