@@ -9,6 +9,7 @@ import customtkinter as ctk
 import sqlite3
 import datetime
 import os
+import sys
 import json
 import re
 import subprocess
@@ -33,7 +34,7 @@ def get_app_data_dir():
 # ─────────────────────────────────────────────
 #  APP SETTINGS
 # ─────────────────────────────────────────────
-APP_NAME = "NSA FAST FOOD"
+APP_NAME = "NSA POINT OF SALE"
 TAX_RATE = 0.00 # No tax for fast food in this scenario
 DB_FILE = os.path.join(get_app_data_dir(), "blazebite.db")
 SETTINGS_FILE = os.path.join(get_app_data_dir(), "settings.json")
@@ -321,16 +322,18 @@ class Database:
         sorted_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
         return sorted_items[:limit]
 
+    _PRODUCT_COLS = "id, category, name, price, desc, quantity, store, COALESCE(archived,0) AS archived, COALESCE(barcode,'') AS barcode"
+
     def get_all_products(self, store: str | None = None, include_archived: bool = False):
         archive_filter = "" if include_archived else " AND COALESCE(archived,0)=0"
         if store:
             cur = self.conn.execute(
-                f"SELECT * FROM products WHERE store = ?{archive_filter} ORDER BY category, name",
+                f"SELECT {self._PRODUCT_COLS} FROM products WHERE store = ?{archive_filter} ORDER BY category, name",
                 (store,),
             )
         else:
             cur = self.conn.execute(
-                f"SELECT * FROM products WHERE 1=1{archive_filter} ORDER BY store, category, name"
+                f"SELECT {self._PRODUCT_COLS} FROM products WHERE 1=1{archive_filter} ORDER BY store, category, name"
             )
         return cur.fetchall()
 
@@ -354,12 +357,12 @@ class Database:
             return None
         if store:
             cur = self.conn.execute(
-                "SELECT * FROM products WHERE barcode=? AND store=? AND COALESCE(archived,0)=0 LIMIT 1",
+                f"SELECT {self._PRODUCT_COLS} FROM products WHERE barcode=? AND store=? AND COALESCE(archived,0)=0 LIMIT 1",
                 (barcode.strip(), store),
             )
         else:
             cur = self.conn.execute(
-                "SELECT * FROM products WHERE barcode=? AND COALESCE(archived,0)=0 LIMIT 1",
+                f"SELECT {self._PRODUCT_COLS} FROM products WHERE barcode=? AND COALESCE(archived,0)=0 LIMIT 1",
                 (barcode.strip(),),
             )
         return cur.fetchone()
@@ -591,13 +594,17 @@ class Database:
                     if not exists:
                         self.add_product(cat, item["name"], item["price"], item["desc"], store=store_key)
 
-        # Create default users if missing
+        # Create default users if missing (never overwrite existing — preserves password changes)
         for store_key, creds in CREDENTIALS.items():
             for role, info in creds.items():
-                self.add_or_update_user(store_key, role, info["user"], info["pass"], create_if_missing=True)
+                existing = self.get_user(store_key, role)
+                if not existing:
+                    self.add_user(store_key, role, info["user"], info["pass"])
 
         # Global root-admin account for system-wide operations
-        self.add_or_update_user("system", "root_admin", "root_admin", "root123", create_if_missing=True)
+        existing_root = self.get_user("system", "root_admin")
+        if not existing_root:
+            self.add_user("system", "root_admin", "root_admin", "root123")
 
     # ── Data Export / Import ────────────────────────────────────
     def export_all_data(self) -> dict:
@@ -1646,7 +1653,7 @@ class BlazeBiteApp(ctk.CTk):
         )
         add_btn.pack(padx=14, pady=(0, 8), fill="x")
 
-        if self.current_role == "admin":
+        if self.current_role in ("admin", "root_admin"):
             # Only admins can edit product details/prices.
             edit_btn = ctk.CTkButton(
                 card, text="✏️ Edit",
@@ -2000,9 +2007,43 @@ class BlazeBiteApp(ctk.CTk):
                 name = buffer.value.strip()
                 return name if name else None
         except Exception:
-            return None
+            pass
+
+        # Fallback: use WMI via PowerShell to get the default printer
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance -ClassName Win32_Printer | Where-Object {$_.Default}).Name"],
+                capture_output=True, text=True, timeout=5,
+            )
+            name = result.stdout.strip()
+            if name:
+                return name
+        except Exception:
+            pass
 
         return None
+
+    def _enumerate_printers(self) -> list[str]:
+        """Return a list of all available printer names on this system."""
+        printers = []
+        if os.name != "nt":
+            return printers
+
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance -ClassName Win32_Printer).Name"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().splitlines():
+                name = line.strip()
+                if name:
+                    printers.append(name)
+        except Exception:
+            pass
+
+        return printers
 
     def _get_receipt_profile(self, printer_name: str | None = None) -> dict:
         """Choose receipt layout based on printer model/paper size hints."""
@@ -2036,6 +2077,7 @@ class BlazeBiteApp(ctk.CTk):
         if os.name != "nt":
             return False, "Raw printing is only supported on Windows."
 
+        # Try ctypes winspool first
         try:
             winspool = ctypes.windll.winspool
 
@@ -2048,7 +2090,7 @@ class BlazeBiteApp(ctk.CTk):
 
             h_printer = wintypes.HANDLE()
             if not winspool.OpenPrinterW(printer_name, ctypes.byref(h_printer), None):
-                raise OSError("OpenPrinterW failed")
+                raise OSError(f"OpenPrinterW failed for '{printer_name}'")
 
             try:
                 doc_info = DOCINFO1("Receipt", None, "RAW")
@@ -2059,7 +2101,7 @@ class BlazeBiteApp(ctk.CTk):
                     if not winspool.StartPagePrinter(h_printer):
                         raise OSError("StartPagePrinter failed")
 
-                    payload = text_payload.encode("ascii", errors="replace")
+                    payload = text_payload.encode("cp437", errors="replace")
                     written = wintypes.DWORD(0)
                     ok = winspool.WritePrinter(
                         h_printer,
@@ -2068,7 +2110,7 @@ class BlazeBiteApp(ctk.CTk):
                         ctypes.byref(written),
                     )
                     if not ok or written.value != len(payload):
-                        raise OSError("WritePrinter failed")
+                        raise OSError(f"WritePrinter failed (wrote {written.value}/{len(payload)})")
 
                     if not winspool.EndPagePrinter(h_printer):
                         raise OSError("EndPagePrinter failed")
@@ -2079,7 +2121,22 @@ class BlazeBiteApp(ctk.CTk):
 
             return True, "Sent to printer via RAW spooler."
         except Exception as e:
-            return False, str(e)
+            raw_err = str(e)
+
+        # Fallback: save to temp text file and print via command line
+        try:
+            tmp_path = os.path.join(get_app_data_dir(), "_receipt_tmp.txt")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(text_payload)
+            # Use PowerShell Out-Printer which works with any installed printer
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-Content -Path '{tmp_path}' | Out-Printer -Name '{printer_name}'"],
+                check=True, timeout=15,
+            )
+            return True, "Sent to printer via PowerShell Out-Printer."
+        except Exception as e2:
+            return False, f"RAW spooler: {raw_err}\nPowerShell fallback: {e2}"
 
     def _build_invoice(self, items, subtotal, tax, total, payment, cash_tendered=None, change=None, printer_name: str | None = None):
         printer_name = printer_name or self._get_default_printer_name()
@@ -2165,30 +2222,70 @@ class BlazeBiteApp(ctk.CTk):
         pdf.save()
 
     def _show_invoice_window(self, invoice: str):
-        printer_name = self._get_default_printer_name()
-        active_profile = self._get_receipt_profile(printer_name)
+        default_printer = self._get_default_printer_name()
+        all_printers = self._enumerate_printers()
+        active_profile = self._get_receipt_profile(default_printer)
         selected_mode = getattr(self, "receipt_paper_profile", "Auto")
         if selected_mode == "Auto":
-            mode_detail = f"Auto ({printer_name if printer_name else 'No default printer'})"
+            mode_detail = f"Auto ({default_printer if default_printer else 'No default printer'})"
         else:
             mode_detail = f"Manual ({selected_mode})"
 
         win = ctk.CTkToplevel(self)
         win.title("Order Receipt")
-        win.geometry("500x640")
+        win.geometry("500x700")
         win.configure(fg_color=COLORS["bg_dark"])
         win.grab_set()
 
         ctk.CTkLabel(win, text="✅  Order Complete!",
                      font=ctk.CTkFont("Helvetica", 18, "bold"),
-                     text_color=COLORS["success"]).pack(pady=(18, 12))
+                     text_color=COLORS["success"]).pack(pady=(18, 8))
 
         ctk.CTkLabel(
             win,
             text=f"Print Profile: {active_profile['paper']}  |  {mode_detail}",
             font=ctk.CTkFont("Helvetica", 10),
             text_color=COLORS["text_muted"],
-        ).pack(pady=(0, 8))
+        ).pack(pady=(0, 4))
+
+        # Printer selector
+        printer_row = ctk.CTkFrame(win, fg_color="transparent")
+        printer_row.pack(fill="x", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(printer_row, text="Printer:",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 8))
+
+        printer_values = all_printers if all_printers else ["(No printers found)"]
+        printer_var = tk.StringVar(value=default_printer if default_printer else printer_values[0])
+        printer_combo = ctk.CTkComboBox(
+            printer_row, values=printer_values, variable=printer_var,
+            width=300, height=32, corner_radius=8,
+            fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 11),
+        )
+        printer_combo.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            printer_row, text="⟳", width=32, height=32, corner_radius=8,
+            fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 13),
+            command=lambda: _refresh_printers(),
+        ).pack(side="left", padx=(6, 0))
+
+        def _refresh_printers():
+            refreshed = self._enumerate_printers()
+            new_default = self._get_default_printer_name()
+            vals = refreshed if refreshed else ["(No printers found)"]
+            printer_combo.configure(values=vals)
+            if new_default and new_default in vals:
+                printer_var.set(new_default)
+            elif vals:
+                printer_var.set(vals[0])
 
         txt = ctk.CTkTextbox(win, fg_color=COLORS["bg_dark"],
                              text_color=COLORS["text_primary"],
@@ -2198,74 +2295,62 @@ class BlazeBiteApp(ctk.CTk):
         txt.insert("end", invoice)
         txt.configure(state="disabled")
 
-        def send_file_to_printer(file_path: str, printer_name: str | None,
-                                 raw_text: str | None = None) -> tuple[bool, str]:
-            """Try multiple print mechanisms so printing works across typical Windows setups."""
-            abs_path = os.path.abspath(file_path)
-
-            # Preferred path for thermal printers: RAW spool preserves monospaced layout.
-            if printer_name and raw_text:
-                ok_raw, raw_msg = self._send_raw_to_printer(printer_name, raw_text + "\n\n\n")
-                if ok_raw:
-                    return True, raw_msg
-
-            try:
-                os.startfile(abs_path, "print")
-                return True, "Sent to the default printer."
-            except Exception as first_error:
-                # Notepad fallback is for text files only.
-                if not abs_path.lower().endswith(".txt"):
-                    printer_msg = f" Default printer: {printer_name}." if printer_name else ""
-                    return False, (
-                        f"Could not send the receipt to the printer.{printer_msg}\n"
-                        f"Primary method error: {first_error}"
-                    )
-                try:
-                    subprocess.run(["notepad.exe", "/p", abs_path], check=True, timeout=20)
-                    return True, "Sent to printer via Notepad fallback."
-                except Exception as second_error:
-                    printer_msg = f" Default printer: {printer_name}." if printer_name else ""
-                    return False, (
-                        f"Could not send the receipt to the printer.{printer_msg}\n"
-                        f"Primary method error: {first_error}\n"
-                        f"Fallback method error: {second_error}"
-                    )
-
         def print_invoice():
-            # Save invoice to PDF file and send directly to printer.
             app_data_dir = get_app_data_dir()
-            printer_name = self._get_default_printer_name()
+            chosen_printer = printer_var.get().strip()
             printable_invoice = invoice
 
+            # Save PDF copy
             fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.pdf")
             self._save_invoice_pdf(printable_invoice, fname)
 
-            if not printer_name:
+            if not chosen_printer or chosen_printer == "(No printers found)":
                 messagebox.showerror(
                     "Printer Not Detected",
-                    "No default printer was detected on this system.\n"
-                    "Set a default printer in Windows Settings and try again.\n"
-                    f"Invoice PDF was still saved as '{fname}'."
+                    "No printer was selected or detected on this system.\n"
+                    "Connect a printer, set it as default in Windows Settings,\n"
+                    "then click ⟳ to refresh the printer list.\n\n"
+                    f"Invoice PDF was still saved as:\n{fname}"
                 )
                 return
 
-            ok, detail = send_file_to_printer(fname, printer_name, raw_text=printable_invoice)
-            try:
-                if ok:
-                    messagebox.showinfo(
-                        "Print Sent",
-                        f"Receipt sent to printer '{printer_name}'.\n"
-                        f"Invoice PDF saved as '{fname}'.\n{detail}"
-                    )
-                else:
-                    messagebox.showerror(
-                        "Print Failed",
-                        f"Detected printer: '{printer_name}', but printing failed.\n"
-                        f"{detail}\n"
-                        f"Invoice PDF saved as '{fname}'."
-                    )
-            except Exception as e:
-                messagebox.showerror("Error", f"Unexpected print error: {str(e)}\nInvoice PDF saved as '{fname}'")
+            # Try RAW text print first (best for thermal/receipt printers)
+            ok, detail = self._send_raw_to_printer(chosen_printer, printable_invoice + "\n\n\n")
+
+            if not ok:
+                # Fallback: save as .txt and print via notepad
+                try:
+                    txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
+                    with open(txt_path, "w", encoding="utf-8") as f:
+                        f.write(printable_invoice)
+                    subprocess.run(["notepad.exe", "/p", txt_path], check=True, timeout=30)
+                    ok = True
+                    detail = "Sent to printer via Notepad."
+                except Exception as e2:
+                    # Final fallback: os.startfile on the PDF
+                    try:
+                        os.startfile(fname, "print")
+                        ok = True
+                        detail = "Sent to default printer via system print handler."
+                    except Exception as e3:
+                        detail = (
+                            f"RAW spooler: {detail}\n"
+                            f"Notepad fallback: {e2}\n"
+                            f"System print: {e3}"
+                        )
+
+            if ok:
+                messagebox.showinfo(
+                    "Print Sent",
+                    f"Receipt sent to '{chosen_printer}'.\n{detail}\n\n"
+                    f"Invoice PDF saved as:\n{fname}"
+                )
+            else:
+                messagebox.showerror(
+                    "Print Failed",
+                    f"Could not print to '{chosen_printer}'.\n\n{detail}\n\n"
+                    f"Invoice PDF was still saved as:\n{fname}"
+                )
 
         btn_row = ctk.CTkFrame(win, fg_color="transparent")
         btn_row.pack(pady=16)
@@ -2426,11 +2511,70 @@ class BlazeBiteApp(ctk.CTk):
         prod_lbl.pack(anchor="w", padx=20, pady=(16, 8))
 
         prod_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
-                      corner_radius=10, height=260)
+                      corner_radius=10, height=400)
         prod_frame.pack(fill="x", padx=16, pady=(0, 12))
         prod_frame.pack_propagate(False)
 
         self._build_product_management(prod_frame)
+
+        # ─── Category Management (admin-scoped to active store) ───
+        cat_lbl = ctk.CTkLabel(admin_scroll, text="📂  Category Management",
+                               font=ctk.CTkFont("Helvetica", 16, "bold"),
+                               text_color=COLORS["text_primary"])
+        cat_lbl.pack(anchor="w", padx=20, pady=(16, 8))
+
+        admin_cat_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                                       corner_radius=10, border_width=1,
+                                       border_color=COLORS["border"])
+        admin_cat_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        admin_cat_header = ctk.CTkFrame(admin_cat_frame, fg_color="transparent")
+        admin_cat_header.pack(fill="x", padx=12, pady=(10, 6))
+
+        ctk.CTkLabel(admin_cat_header,
+                     text="Manage categories for your store. Add, rename, or remove categories.",
+                     font=ctk.CTkFont("Helvetica", 10),
+                     text_color=COLORS["text_muted"]).pack(side="left")
+
+        ctk.CTkButton(
+            admin_cat_header, text="+ Add Category", width=130, height=30,
+            fg_color=COLORS["success"], hover_color="#059669",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._admin_add_category,
+        ).pack(side="right", padx=(8, 0))
+
+        admin_cat_cols = ("ID", "Name", "Sort Order")
+        self.admin_cat_tree = ttk.Treeview(
+            admin_cat_frame, columns=admin_cat_cols, show="headings",
+            style="Custom.Treeview", height=5,
+        )
+        for col, w in zip(admin_cat_cols, [60, 300, 100]):
+            self.admin_cat_tree.heading(col, text=col)
+            self.admin_cat_tree.column(col, width=w, anchor="center" if col != "Name" else "w")
+
+        admin_cat_scroll_y = ttk.Scrollbar(admin_cat_frame, orient="vertical",
+                                           command=self.admin_cat_tree.yview)
+        self.admin_cat_tree.configure(yscrollcommand=admin_cat_scroll_y.set)
+        admin_cat_scroll_y.pack(side="right", fill="y", padx=(0, 4), pady=6)
+        self.admin_cat_tree.pack(fill="x", padx=8, pady=(0, 6))
+
+        admin_cat_actions = ctk.CTkFrame(admin_cat_frame, fg_color="transparent")
+        admin_cat_actions.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkButton(
+            admin_cat_actions, text="Edit Selected", width=120, height=30,
+            fg_color=COLORS["warning"], hover_color="#D97706",
+            text_color="white", font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._admin_edit_category,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            admin_cat_actions, text="Delete Selected", width=120, height=30,
+            fg_color=COLORS["error"], hover_color="#DC2626",
+            text_color="white", font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._admin_delete_category,
+        ).pack(side="left")
 
         # Receipt printer settings
         receipt_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
@@ -3402,6 +3546,15 @@ class BlazeBiteApp(ctk.CTk):
                 self.admin_items_store_var.get() if hasattr(self, "admin_items_store_var") else "All",
             )
 
+        # Refresh admin category tree
+        if hasattr(self, "admin_cat_tree"):
+            self._refresh_admin_categories()
+
+        # Refresh product management
+        self.menu_data = self._load_menu()
+        if hasattr(self, "prod_scroll"):
+            self._refresh_product_management()
+
     def _on_admin_items_store_change(self):
         if hasattr(self, "admin_items_tree") and hasattr(self, "admin_items_store_var"):
             self._populate_system_items_tree(self.admin_items_tree, self.admin_items_store_var.get())
@@ -3409,6 +3562,167 @@ class BlazeBiteApp(ctk.CTk):
     def _on_root_items_store_change(self):
         if hasattr(self, "root_items_tree") and hasattr(self, "root_items_store_var"):
             self._populate_system_items_tree(self.root_items_tree, self.root_items_store_var.get())
+
+    # ─── Admin Category Management ─────────────────────────────
+    def _refresh_admin_categories(self):
+        if not hasattr(self, "admin_cat_tree"):
+            return
+        for row in self.admin_cat_tree.get_children():
+            self.admin_cat_tree.delete(row)
+        for cat_id, store, name, sort_order in self.db.get_categories(store=self.active_store):
+            self.admin_cat_tree.insert("", "end", iid=str(cat_id),
+                                       values=(cat_id, name, sort_order))
+
+    def _admin_add_category(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add Category")
+        dialog.geometry("380x220")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        store_label = STORE_LABELS.get(self.active_store, self.active_store or "Store")
+        ctk.CTkLabel(dialog, text=f"Add category to {store_label}",
+                     font=ctk.CTkFont("Helvetica", 13, "bold"),
+                     text_color=COLORS["text_primary"]).pack(pady=(16, 8))
+
+        ctk.CTkLabel(dialog, text="Category Name:",
+                     font=ctk.CTkFont("Helvetica", 12),
+                     text_color=COLORS["text_secondary"]).pack(pady=(4, 2))
+        name_entry = ctk.CTkEntry(dialog, width=250, placeholder_text="e.g. 🍕 Pizza",
+                                  fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                  text_color=COLORS["text_primary"])
+        name_entry.pack(pady=4)
+
+        ctk.CTkLabel(dialog, text="Sort Order:",
+                     font=ctk.CTkFont("Helvetica", 12),
+                     text_color=COLORS["text_secondary"]).pack(pady=(4, 2))
+        order_entry = ctk.CTkEntry(dialog, width=250, placeholder_text="0",
+                                   fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                   text_color=COLORS["text_primary"])
+        order_entry.insert(0, "0")
+        order_entry.pack(pady=4)
+
+        def save():
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Category name is required.")
+                return
+            try:
+                sort_order = int(order_entry.get().strip() or "0")
+            except ValueError:
+                messagebox.showerror("Error", "Sort order must be a number.")
+                return
+            existing = self.db.get_category_names(self.active_store)
+            if name in existing:
+                messagebox.showerror("Error", f"Category '{name}' already exists.")
+                return
+            self.db.add_category(self.active_store, name, sort_order)
+            self.db.log_activity(
+                self.current_user or "unknown", self.current_role or "admin",
+                "ADD_CATEGORY", name, f"store={self.active_store}, sort_order={sort_order}",
+                store=self.active_store,
+            )
+            self._refresh_admin_categories()
+            self.menu_data = self._load_menu()
+            self._refresh_category_buttons()
+            if hasattr(self, "prod_scroll"):
+                self._refresh_product_management()
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Category '{name}' added.")
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="Save", width=100, command=save).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, command=dialog.destroy).pack(side="left", padx=5)
+
+    def _admin_edit_category(self):
+        sel = self.admin_cat_tree.selection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select a category to edit.")
+            return
+        cat_id = int(sel[0])
+        vals = self.admin_cat_tree.item(sel[0], "values")
+        old_name = vals[1]
+        old_order = vals[2]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Edit Category")
+        dialog.geometry("380x200")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        ctk.CTkLabel(dialog, text="Category Name:",
+                     font=ctk.CTkFont("Helvetica", 12),
+                     text_color=COLORS["text_secondary"]).pack(pady=(16, 2))
+        name_entry = ctk.CTkEntry(dialog, width=250,
+                                  fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                  text_color=COLORS["text_primary"])
+        name_entry.insert(0, old_name)
+        name_entry.pack(pady=4)
+
+        ctk.CTkLabel(dialog, text="Sort Order:",
+                     font=ctk.CTkFont("Helvetica", 12),
+                     text_color=COLORS["text_secondary"]).pack(pady=(4, 2))
+        order_entry = ctk.CTkEntry(dialog, width=250,
+                                   fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+                                   text_color=COLORS["text_primary"])
+        order_entry.insert(0, str(old_order))
+        order_entry.pack(pady=4)
+
+        def save():
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Category name is required.")
+                return
+            try:
+                sort_order = int(order_entry.get().strip() or "0")
+            except ValueError:
+                messagebox.showerror("Error", "Sort order must be a number.")
+                return
+            self.db.update_category(cat_id, name, sort_order)
+            self.db.log_activity(
+                self.current_user or "unknown", self.current_role or "admin",
+                "EDIT_CATEGORY", name, f"old_name={old_name}, sort_order={sort_order}",
+                store=self.active_store,
+            )
+            self._refresh_admin_categories()
+            self.menu_data = self._load_menu()
+            self._refresh_category_buttons()
+            if hasattr(self, "prod_scroll"):
+                self._refresh_product_management()
+            dialog.destroy()
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="Save", width=100, command=save).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, command=dialog.destroy).pack(side="left", padx=5)
+
+    def _admin_delete_category(self):
+        sel = self.admin_cat_tree.selection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select a category to delete.")
+            return
+        cat_id = int(sel[0])
+        vals = self.admin_cat_tree.item(sel[0], "values")
+        cat_name = vals[1]
+        if not messagebox.askyesno("Confirm Delete",
+                                    f"Delete category '{cat_name}'?\n\n"
+                                    "Products in this category will NOT be deleted,\n"
+                                    "but will no longer appear under this category heading."):
+            return
+        self.db.delete_category(cat_id)
+        self.db.log_activity(
+            self.current_user or "unknown", self.current_role or "admin",
+            "DELETE_CATEGORY", cat_name, "",
+            store=self.active_store,
+        )
+        self._refresh_admin_categories()
+        self.menu_data = self._load_menu()
+        self._refresh_category_buttons()
+        if hasattr(self, "prod_scroll"):
+            self._refresh_product_management()
 
     # ─── Category Management Handlers ──────────────────────────
     def _refresh_root_categories(self):
@@ -4068,20 +4382,69 @@ class BlazeBiteApp(ctk.CTk):
                 self.report_tree.insert("", "end", values=(label, qty, f"{rev:,.2f}"))
 
     def _build_product_management(self, parent):
+        # Search bar (outside scroll so it stays pinned at top)
+        search_row = ctk.CTkFrame(parent, fg_color="transparent")
+        search_row.pack(fill="x", padx=8, pady=(8, 0))
+
+        ctk.CTkLabel(search_row, text="🔍", font=ctk.CTkFont("Helvetica", 14),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(4, 4))
+
+        self._prod_search_var = tk.StringVar()
+        prod_search_entry = ctk.CTkEntry(
+            search_row, textvariable=self._prod_search_var,
+            placeholder_text="Search products by name, category, or barcode...",
+            height=34, corner_radius=8,
+            fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 11),
+        )
+        prod_search_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        prod_search_entry.bind("<KeyRelease>", lambda _e: self._filter_product_management())
+
+        ctk.CTkButton(
+            search_row, text="Clear", width=60, height=34, corner_radius=8,
+            fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+            text_color=COLORS["text_secondary"],
+            font=ctk.CTkFont("Helvetica", 11),
+            command=lambda: (self._prod_search_var.set(""), self._filter_product_management()),
+        ).pack(side="left")
+
         self.prod_scroll = ctk.CTkScrollableFrame(parent, fg_color=COLORS["bg_dark"], corner_radius=0)
-        self.prod_scroll.pack(fill="both", expand=True, padx=8, pady=8)
+        self.prod_scroll.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self._build_product_management_content()
 
-    def _build_product_management_content(self):
+    def _filter_product_management(self):
+        query = self._prod_search_var.get().strip().lower()
+        for widget in self.prod_scroll.winfo_children():
+            widget.destroy()
+        self._build_product_management_content(search_query=query)
+
+    def _build_product_management_content(self, search_query: str = ""):
         self.product_frames = []
         # Add new product button
         add_btn = ctk.CTkButton(self.prod_scroll, text="+ Add New Product", height=38, corner_radius=10, fg_color=COLORS["success"], hover_color="#059669", text_color="white", font=ctk.CTkFont("Helvetica", 12, "bold"), command=self._add_new_product)
-        add_btn.pack(pady=(12, 20), padx=10, fill="x")
+        add_btn.pack(pady=(8, 12), padx=10, fill="x")
+
+        found_any = False
         for cat, items in self.menu_data.items():
+            # Filter items if search query is active
+            if search_query:
+                filtered = [i for i in items if (
+                    search_query in i['name'].lower()
+                    or search_query in cat.lower()
+                    or search_query in (i.get('barcode', '') or '').lower()
+                    or search_query in (i.get('desc', '') or '').lower()
+                )]
+            else:
+                filtered = items
+
+            if not filtered:
+                continue
+            found_any = True
             # Category header
             cat_label = ctk.CTkLabel(self.prod_scroll, text=cat, font=ctk.CTkFont("Helvetica", 16, "bold"), text_color=COLORS["accent_glow"])
             cat_label.pack(anchor="w", pady=(16, 8), padx=10)
-            for item in items:
+            for item in filtered:
                 item_frame = ctk.CTkFrame(self.prod_scroll, fg_color=COLORS["bg_card"], corner_radius=10, border_width=1, border_color=COLORS["border"])
                 item_frame.pack(fill="x", padx=4, pady=3)
                 # Name
@@ -4093,7 +4456,7 @@ class BlazeBiteApp(ctk.CTk):
                     bc_label = ctk.CTkLabel(item_frame, text=f"⊟ {item_barcode}", font=ctk.CTkFont("Helvetica", 10), text_color=COLORS["gold"])
                     bc_label.pack(side="left", padx=4, pady=10)
                 # Stock quantity badge
-                qty = item.get('quantity', 0)
+                qty = int(item.get('quantity', 0) or 0)
                 qty_color = COLORS["success"] if qty > 0 else COLORS["error"]
                 qty_label = ctk.CTkLabel(item_frame, text=f"Stock: {qty}", font=ctk.CTkFont("Helvetica", 10, "bold"), text_color=qty_color)
                 qty_label.pack(side="left", padx=8, pady=10)
@@ -4114,6 +4477,13 @@ class BlazeBiteApp(ctk.CTk):
                 delete_btn = ctk.CTkButton(item_frame, text="Delete", width=65, height=32, corner_radius=7, fg_color=COLORS["error"], text_color="white", font=ctk.CTkFont("Helvetica", 11, "bold"), command=lambda i=item: self._delete_product(i))
                 delete_btn.pack(side="right", padx=5, pady=10)
                 self.product_frames.append((item_frame, price_var))
+
+        if search_query and not found_any:
+            ctk.CTkLabel(
+                self.prod_scroll, text=f"No products matching \"{search_query}\"",
+                font=ctk.CTkFont("Helvetica", 13),
+                text_color=COLORS["text_muted"],
+            ).pack(pady=30)
 
     def _update_product_price(self, item, price_var):
         if self.current_role not in ("admin", "root_admin"):
@@ -4189,7 +4559,8 @@ class BlazeBiteApp(ctk.CTk):
         # Clear efficiently
         for widget in self.prod_scroll.winfo_children():
             widget.destroy()
-        self._build_product_management_content()
+        query = self._prod_search_var.get().strip().lower() if hasattr(self, '_prod_search_var') else ""
+        self._build_product_management_content(search_query=query)
 
     def _build_user_management(self, parent):
         self.user_scroll = ctk.CTkScrollableFrame(parent, fg_color=COLORS["bg_dark"], corner_radius=0)
@@ -4756,7 +5127,9 @@ class BlazeBiteApp(ctk.CTk):
         ctk.CTkFrame(brand, fg_color="transparent", height=40).pack()
 
         # ── NSA Logo — Official Image ──
-        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nsa_logo.png")
+        # When frozen by PyInstaller, files are extracted to sys._MEIPASS
+        base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        logo_path = os.path.join(base_dir, "nsa_logo.png")
         try:
             pil_img = PILImage.open(logo_path).convert("RGBA")
             # Resize to fit the brand panel (max width 260, preserve aspect)

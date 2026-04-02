@@ -5,6 +5,8 @@ from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = collect_all("customtkinter")
 
+# Bundle the NSA logo image
+datas += [("nsa_logo.png", ".")]
 
 a = Analysis(
     ["main.py"],
