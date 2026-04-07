@@ -2363,12 +2363,12 @@ class BlazeBiteApp(ctk.CTk):
 
     # ── Direct USB printing via python-escpos ─
 
-    # Known Epson USB product IDs – extend as needed
+    # Known Epson USB product IDs + python-escpos profile names
     _ESCPOS_USB_PROFILES = [
-        (0x04B8, 0x0E28),   # Epson TM-T20III
-        (0x04B8, 0x0202),   # Epson TM-T20II
-        (0x04B8, 0x0E15),   # Epson TM-T20II (alt)
-        (0x04B8, 0x0E03),   # Epson TM-T88V
+        (0x04B8, 0x0E28, "TM-T20II"),   # Epson TM-T20III (uses TM-T20II profile – same command set)
+        (0x04B8, 0x0202, "TM-T20II"),   # Epson TM-T20II
+        (0x04B8, 0x0E15, "TM-T20II"),   # Epson TM-T20II (alt PID)
+        (0x04B8, 0x0E03, "TM-T88V"),    # Epson TM-T88V
     ]
 
     def _print_via_escpos(self, order_data: dict) -> tuple[bool, str]:
@@ -2393,12 +2393,12 @@ class BlazeBiteApp(ctk.CTk):
         MID = "-" * W
         now = datetime.datetime.now()
 
-        # Try each known VID/PID
+        # Try each known VID/PID with its profile
         p = None
         used_id = None
-        for vid, pid in self._ESCPOS_USB_PROFILES:
+        for vid, pid, profile in self._ESCPOS_USB_PROFILES:
             try:
-                p = EscposUsb(vid, pid, in_ep=0x82, out_ep=0x01)
+                p = EscposUsb(vid, pid, in_ep=0x82, out_ep=0x01, profile=profile)
                 used_id = (vid, pid)
                 break
             except Exception:
