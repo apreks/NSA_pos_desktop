@@ -17,7 +17,6 @@ import ctypes
 from ctypes import wintypes
 from tkinter import messagebox, ttk
 import tkinter as tk
-from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from PIL import Image as PILImage, ImageTk
 
@@ -1983,8 +1982,13 @@ class BlazeBiteApp(ctk.CTk):
         # Generate invoice
         invoice = self._build_invoice(items_list, subtotal, tax, total, payment, cash_tendered, change)
 
-        # Show invoice window
-        self._show_invoice_window(invoice)
+        # Show invoice window (pass order data for ESC/POS printing)
+        order_data = {
+            "items": items_list, "subtotal": subtotal, "tax": tax,
+            "total": total, "payment": payment,
+            "cash_tendered": cash_tendered, "change": change,
+        }
+        self._show_invoice_window(invoice, order_data)
 
         # Reset
         self._clear_order()
@@ -2045,39 +2049,244 @@ class BlazeBiteApp(ctk.CTk):
 
         return printers
 
+    # ═══════════════════════════════════════════
+    #  RECEIPT & PRINTING ENGINE
+    # ═══════════════════════════════════════════
+
     def _get_receipt_profile(self, printer_name: str | None = None) -> dict:
-        """Choose receipt layout based on printer model/paper size hints."""
-        forced_profile = getattr(self, "receipt_paper_profile", "Auto")
-        if forced_profile == "80mm":
-            return {"paper": "80mm", "line_width": 42, "qty_w": 3, "amt_w": 10}
-        if forced_profile == "58mm":
-            return {"paper": "58mm", "line_width": 32, "qty_w": 3, "amt_w": 9}
+        """Return column-width profile for the active paper size.
+
+        Standard ESC/POS thermal receipt printers:
+          80mm paper  ➜  72mm printable  ➜  Font A 12×24 = 48 cols
+          58mm paper  ➜  48mm printable  ➜  Font A 12×24 = 32 cols
+
+        The profile is chosen by:
+          1. Manual override saved in settings (80mm / 58mm)
+          2. Auto-detect from the Windows printer name
+          3. Fallback to 48 cols (safe default – fits both 80mm and most 58mm)
+        """
+        forced = getattr(self, "receipt_paper_profile", "Auto")
+        if forced == "80mm":
+            return {"paper": "80mm", "line_width": 48, "mm": 80}
+        if forced == "58mm":
+            return {"paper": "58mm", "line_width": 32, "mm": 58}
 
         name = (printer_name or "").lower()
+        # Known 58mm models / keywords
+        if any(t in name for t in ("58mm", "58 mm", "pos-58", "xp-58", "tm-p20", "rp58")):
+            return {"paper": "58mm", "line_width": 32, "mm": 58}
+        # Everything else (Epson TM-T20, TM-T88, Star TSP, generic 80mm POS)
+        return {"paper": "80mm", "line_width": 48, "mm": 80}
 
-        # Epson TM-T20II is typically an 80mm receipt printer.
-        if "tm-t20ii" in name or ("epson" in name and "tm-t20" in name):
-            return {"paper": "80mm", "line_width": 42, "qty_w": 3, "amt_w": 10}
+    # ── Text receipt builder ──────────────────
 
-        # Common 58mm thermal printers
-        if any(token in name for token in ("58mm", "58 mm", "pos-58", "xp-58", "tm-p20")):
-            return {"paper": "58mm", "line_width": 32, "qty_w": 3, "amt_w": 9}
+    @staticmethod
+    def _center(text: str, w: int) -> str:
+        t = (text or "").strip()
+        return t[:w] if len(t) >= w else t.center(w)
 
-        # Safe default for most POS thermal setups
-        return {"paper": "80mm", "line_width": 42, "qty_w": 3, "amt_w": 10}
+    @staticmethod
+    def _left_right(left: str, right: str, w: int) -> str:
+        """Place *left* flush-left and *right* flush-right on one line."""
+        gap = w - len(left) - len(right)
+        if gap < 1:
+            left = left[:w - len(right) - 1]
+            gap = 1
+        return left + " " * gap + right
 
-    def _center_receipt_text(self, text: str, width: int) -> str:
-        text = (text or "").strip()
-        if len(text) >= width:
-            return text[:width]
-        return text.center(width)
+    def _build_invoice(self, items, subtotal, tax, total, payment,
+                       cash_tendered=None, change=None,
+                       printer_name: str | None = None) -> str:
+        printer_name = printer_name or self._get_default_printer_name()
+        W = self._get_receipt_profile(printer_name)["line_width"]
 
-    def _send_raw_to_printer(self, printer_name: str, text_payload: str) -> tuple[bool, str]:
-        """Send text directly to the Windows spooler as RAW data."""
+        now = datetime.datetime.now()
+        SEP = "=" * W
+        MID = "-" * W
+
+        lines: list[str] = []
+        c = self._center
+        lr = self._left_right
+
+        # ── Header ──
+        lines.append(SEP)
+        lines.append(c(f"{APP_NAME}", W))
+        lines.append(c("Restaurant", W))
+        lines.append(c("46 Patrice Lumumba Rd, Airport", W))
+        lines.append(c("P.O. Box 46, State House - Accra", W))
+        lines.append(c("GA-117-2059", W))
+        lines.append(SEP)
+
+        # ── Order info ──
+        lines.append(lr("Date:", now.strftime("%Y-%m-%d"), W))
+        lines.append(lr("Time:", now.strftime("%H:%M:%S"), W))
+        lines.append(lr("Order:", f"#{self.order_counter:04d}", W))
+        lines.append(MID)
+
+        # ── Column header ──
+        # Use a 3-column layout: ITEM | QTY | AMOUNT
+        qty_w = 4
+        amt_w = 12
+        name_w = W - qty_w - amt_w - 2          # 2 spaces for gaps
+
+        def item_row(n: str, q, a: str) -> str:
+            n = (n or "")[:name_w]
+            return f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}"
+
+        lines.append(item_row("ITEM", "QTY", "AMOUNT"))
+        lines.append(MID)
+
+        # ── Items ──
+        for it in items:
+            amt = it["price"] * it["qty"]
+            lines.append(item_row(it["name"], it["qty"], f"GHS{amt:.2f}"))
+
+        lines.append(MID)
+
+        # ── Totals ──
+        lines.append(lr("Subtotal:", f"GHS{subtotal:.2f}", W))
+        tax_pct = TAX_RATE * 100
+        if tax_pct > 0:
+            lines.append(lr(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}", W))
+        lines.append(SEP)
+        lines.append(lr("TOTAL:", f"GHS{total:.2f}", W))
+        lines.append(SEP)
+
+        # ── Payment ──
+        lines.append(lr("Payment:", payment, W))
+        if payment == "Cash" and cash_tendered is not None and change is not None:
+            lines.append(lr("Cash Tendered:", f"GHS{cash_tendered:.2f}", W))
+            lines.append(lr("Change:", f"GHS{change:.2f}", W))
+
+        # ── Footer ──
+        lines.append("")
+        lines.append(c("Thank You For Your Patronage", W))
+        lines.append(c("See You Soon!", W))
+        lines.append(SEP)
+
+        return "\n".join(lines)
+
+    # ── ESC/POS receipt builder (hardware-aligned) ─
+
+    def _build_escpos_receipt(self, items, subtotal, tax, total, payment,
+                              cash_tendered=None, change=None) -> bytes:
+        """Build an ESC/POS byte stream that prints correctly on any
+        thermal receipt printer (Epson, Star, Bixolon, generic POS, etc.).
+
+        Instead of space-padding text and hoping the column count matches,
+        this uses the printer's own alignment commands:
+          ESC a 0 = left-align
+          ESC a 1 = center-align
+        so the hardware renders each line correctly regardless of margins,
+        character pitch, or firmware differences.
+        """
+        W = self._get_receipt_profile(self._get_default_printer_name())["line_width"]
+        buf = bytearray()
+
+        # ── Printer init ──
+        buf += b'\x1b\x40'            # ESC @  – reset to defaults
+        buf += b'\x1b\x4d\x00'        # ESC M 0 – Font A (widest)
+        buf += b'\x1b\x74\x00'        # ESC t 0 – code page PC437
+
+        SEP = ("=" * W).encode("cp437")
+        MID = ("-" * W).encode("cp437")
+
+        def _enc(s: str) -> bytes:
+            return s.encode("cp437", errors="replace")
+
+        def center(text: str):
+            buf.extend(b'\x1b\x61\x01')    # ESC a 1 – center
+            buf.extend(_enc(text))
+            buf.extend(b'\n')
+
+        def left(text: str):
+            buf.extend(b'\x1b\x61\x00')    # ESC a 0 – left
+            buf.extend(_enc(text))
+            buf.extend(b'\n')
+
+        def left_sep():
+            buf.extend(b'\x1b\x61\x00')
+            buf.extend(SEP)
+            buf.extend(b'\n')
+
+        def left_mid():
+            buf.extend(b'\x1b\x61\x00')
+            buf.extend(MID)
+            buf.extend(b'\n')
+
+        def lr(l: str, r: str):
+            """Left-right justified line – space-filled to W."""
+            gap = max(1, W - len(l) - len(r))
+            left(l + " " * gap + r)
+
+        # ── Header (centered) ──
+        center("=" * W)
+        center(APP_NAME)
+        center("Restaurant")
+        center("46 Patrice Lumumba Rd, Airport")
+        center("P.O. Box 46, State House - Accra")
+        center("GA-117-2059")
+        center("=" * W)
+
+        # ── Order info (left-aligned) ──
+        now = datetime.datetime.now()
+        lr("Date:", now.strftime("%Y-%m-%d"))
+        lr("Time:", now.strftime("%H:%M:%S"))
+        lr("Order:", f"#{self.order_counter:04d}")
+        left_mid()
+
+        # ── Column header & items ──
+        qty_w = 4
+        amt_w = 12
+        name_w = W - qty_w - amt_w - 2
+
+        def item_line(n: str, q, a: str):
+            n = (n or "")[:name_w]
+            left(f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}")
+
+        item_line("ITEM", "QTY", "AMOUNT")
+        left_mid()
+
+        for it in items:
+            amt = it["price"] * it["qty"]
+            item_line(it["name"], it["qty"], f"GHS{amt:.2f}")
+
+        left_mid()
+
+        # ── Totals ──
+        lr("Subtotal:", f"GHS{subtotal:.2f}")
+        tax_pct = TAX_RATE * 100
+        if tax_pct > 0:
+            lr(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}")
+        left_sep()
+        lr("TOTAL:", f"GHS{total:.2f}")
+        left_sep()
+
+        # ── Payment ──
+        lr("Payment:", payment)
+        if payment == "Cash" and cash_tendered is not None and change is not None:
+            lr("Cash Tendered:", f"GHS{cash_tendered:.2f}")
+            lr("Change:", f"GHS{change:.2f}")
+
+        # ── Footer (centered) ──
+        left("")
+        center("Thank You For Your Patronage")
+        center("See You Soon!")
+        center("=" * W)
+
+        # ── Feed and cut ──
+        buf += b'\n\n\n\n'             # feed past tear bar
+        buf += b'\x1d\x56\x42\x00'    # GS V 66 0 – partial cut (most compatible)
+
+        return bytes(buf)
+
+    # ── Send raw bytes to Windows spooler ─────
+
+    def _send_raw_to_printer(self, printer_name: str, raw_bytes: bytes) -> tuple[bool, str]:
+        """Send raw bytes to the Windows print spooler (RAW datatype)."""
         if os.name != "nt":
             return False, "Raw printing is only supported on Windows."
 
-        # Try ctypes winspool first
         try:
             winspool = ctypes.windll.winspool
 
@@ -2091,26 +2300,21 @@ class BlazeBiteApp(ctk.CTk):
             h_printer = wintypes.HANDLE()
             if not winspool.OpenPrinterW(printer_name, ctypes.byref(h_printer), None):
                 raise OSError(f"OpenPrinterW failed for '{printer_name}'")
-
             try:
                 doc_info = DOCINFO1("Receipt", None, "RAW")
                 if winspool.StartDocPrinterW(h_printer, 1, ctypes.byref(doc_info)) == 0:
                     raise OSError("StartDocPrinterW failed")
-
                 try:
                     if not winspool.StartPagePrinter(h_printer):
                         raise OSError("StartPagePrinter failed")
 
-                    payload = text_payload.encode("cp437", errors="replace")
                     written = wintypes.DWORD(0)
                     ok = winspool.WritePrinter(
-                        h_printer,
-                        payload,
-                        len(payload),
+                        h_printer, raw_bytes, len(raw_bytes),
                         ctypes.byref(written),
                     )
-                    if not ok or written.value != len(payload):
-                        raise OSError(f"WritePrinter failed (wrote {written.value}/{len(payload)})")
+                    if not ok or written.value != len(raw_bytes):
+                        raise OSError(f"WritePrinter wrote {written.value}/{len(raw_bytes)}")
 
                     if not winspool.EndPagePrinter(h_printer):
                         raise OSError("EndPagePrinter failed")
@@ -2121,107 +2325,38 @@ class BlazeBiteApp(ctk.CTk):
 
             return True, "Sent to printer via RAW spooler."
         except Exception as e:
-            raw_err = str(e)
+            return False, str(e)
 
-        # Fallback: save to temp text file and print via command line
-        try:
-            tmp_path = os.path.join(get_app_data_dir(), "_receipt_tmp.txt")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(text_payload)
-            # Use PowerShell Out-Printer which works with any installed printer
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"Get-Content -Path '{tmp_path}' | Out-Printer -Name '{printer_name}'"],
-                check=True, timeout=15,
-            )
-            return True, "Sent to printer via PowerShell Out-Printer."
-        except Exception as e2:
-            return False, f"RAW spooler: {raw_err}\nPowerShell fallback: {e2}"
-
-    def _build_invoice(self, items, subtotal, tax, total, payment, cash_tendered=None, change=None, printer_name: str | None = None):
-        printer_name = printer_name or self._get_default_printer_name()
-        profile = self._get_receipt_profile(printer_name)
-        width = profile["line_width"]
-        qty_w = profile["qty_w"]
-        amt_w = profile["amt_w"]
-        name_w = max(8, width - qty_w - amt_w - 2)
-
-        now = datetime.datetime.now()
-
-        def _row(name: str, qty: int | str, amount: str):
-            name_txt = (name or "")[:name_w]
-            qty_txt = str(qty)
-            return f"{name_txt:<{name_w}} {qty_txt:>{qty_w}} {amount:>{amt_w}}"
-
-        tax_pct = TAX_RATE * 100
-        sep = "=" * width
-        mid = "-" * width
-
-        lines = [
-            sep,
-            self._center_receipt_text(f"{APP_NAME} Restaurant", width),
-            self._center_receipt_text("46 Patrice Lumumba Road, Airport", width),
-            self._center_receipt_text("P.O. Box 46, State House - Accra", width),
-            self._center_receipt_text("GA-117-2059", width),
-            sep,
-            f"Date : {now.strftime('%Y-%m-%d')}",
-            f"Time : {now.strftime('%H:%M:%S')}",
-            f"Order: #{self.order_counter:04d}",
-            mid,
-            _row("ITEM", "Q", "AMOUNT"),
-            mid,
-        ]
-
-        for item in items:
-            line_total = item["price"] * item["qty"]
-            lines.append(_row(item["name"], item["qty"], f"GHS{line_total:.2f}"))
-
-        total_label_w = max(8, width - 13)
-        lines += [
-            mid,
-            f"{'Subtotal':<{total_label_w}} GHS{subtotal:>9.2f}",
-            f"{f'Tax ({tax_pct:.0f}%)':<{total_label_w}} GHS{tax:>9.2f}",
-            sep,
-            f"{'TOTAL':<{total_label_w}} GHS{total:>9.2f}",
-            sep,
-            f"Payment: {payment}",
-        ]
-
-        if payment == "Cash" and cash_tendered is not None and change is not None:
-            lines.append(f"{'Cash Tendered':<{total_label_w}} GHS{cash_tendered:>9.2f}")
-            lines.append(f"{'Change':<{total_label_w}} GHS{change:>9.2f}")
-
-        lines += [
-            "",
-            self._center_receipt_text("Thank You For Your Patronage", width),
-            self._center_receipt_text("See You Soon!", width),
-            sep,
-        ]
-
-        return "\n".join(lines)
+    # ── PDF receipt (compact, receipt-width) ───
 
     def _save_invoice_pdf(self, invoice_text: str, output_path: str):
-        """Render invoice text to a simple PDF file."""
-        page_w, page_h = A4
-        margin = 36
-        line_height = 12
+        """Render receipt text to a receipt-width PDF (for archival / fallback)."""
+        profile = self._get_receipt_profile(self._get_default_printer_name())
+        W = profile["line_width"]
+        mm = profile["mm"]
 
-        pdf = canvas.Canvas(output_path, pagesize=A4)
+        PT_PER_MM = 2.8346
+        page_w = mm * PT_PER_MM
+        margin = 4
+        printable = page_w - 2 * margin
+        # Courier char width ≈ 0.6 × font_size; solve for font_size
+        font_size = max(5.0, round(printable / (W * 0.6), 1))
+        line_h = font_size + 2
+
+        lines = invoice_text.splitlines()
+        page_h = margin + len(lines) * line_h + margin
+
+        pdf = canvas.Canvas(output_path, pagesize=(page_w, page_h))
         pdf.setTitle(f"Invoice #{self.order_counter:04d}")
-        pdf.setFont("Courier", 10)
+        pdf.setFont("Courier", font_size)
 
-        y = page_h - margin
-        for line in invoice_text.splitlines():
-            if y < margin:
-                pdf.showPage()
-                pdf.setFont("Courier", 10)
-                y = page_h - margin
+        y = page_h - margin - font_size
+        for line in lines:
             pdf.drawString(margin, y, line)
-            y -= line_height
-
+            y -= line_h
         pdf.save()
 
-    def _show_invoice_window(self, invoice: str):
+    def _show_invoice_window(self, invoice: str, order_data: dict | None = None):
         default_printer = self._get_default_printer_name()
         all_printers = self._enumerate_printers()
         active_profile = self._get_receipt_profile(default_printer)
@@ -2300,9 +2435,9 @@ class BlazeBiteApp(ctk.CTk):
             chosen_printer = printer_var.get().strip()
             printable_invoice = invoice
 
-            # Save PDF copy
-            fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.pdf")
-            self._save_invoice_pdf(printable_invoice, fname)
+            # Save PDF archive copy
+            pdf_fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.pdf")
+            self._save_invoice_pdf(printable_invoice, pdf_fname)
 
             if not chosen_printer or chosen_printer == "(No printers found)":
                 messagebox.showerror(
@@ -2310,46 +2445,78 @@ class BlazeBiteApp(ctk.CTk):
                     "No printer was selected or detected on this system.\n"
                     "Connect a printer, set it as default in Windows Settings,\n"
                     "then click ⟳ to refresh the printer list.\n\n"
-                    f"Invoice PDF was still saved as:\n{fname}"
+                    f"Invoice PDF was still saved as:\n{pdf_fname}"
                 )
                 return
 
-            # Try RAW text print first (best for thermal/receipt printers)
-            ok, detail = self._send_raw_to_printer(chosen_printer, printable_invoice + "\n\n\n")
+            # Save receipt as text file for printing
+            txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(printable_invoice)
 
-            if not ok:
-                # Fallback: save as .txt and print via notepad
+            ok = False
+            detail = ""
+
+            # Method 1: PowerShell Out-Printer (uses Epson driver, respects paper size)
+            safe_printer = chosen_printer.replace("'", "''")
+            safe_path = txt_path.replace("'", "''")
+            try:
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"Get-Content -Path '{safe_path}' | Out-Printer -Name '{safe_printer}'"],
+                    check=True, timeout=15, capture_output=True,
+                )
+                ok = True
+                detail = "Sent to printer via Out-Printer."
+            except Exception as e1:
+                err1 = str(e1)
+
+                # Method 2: RAW ESC/POS (for thermal printers)
                 try:
-                    txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
-                    with open(txt_path, "w", encoding="utf-8") as f:
-                        f.write(printable_invoice)
-                    subprocess.run(["notepad.exe", "/p", txt_path], check=True, timeout=30)
-                    ok = True
-                    detail = "Sent to printer via Notepad."
-                except Exception as e2:
-                    # Final fallback: os.startfile on the PDF
-                    try:
-                        os.startfile(fname, "print")
+                    if order_data:
+                        escpos_data = self._build_escpos_receipt(
+                            order_data["items"], order_data["subtotal"],
+                            order_data["tax"], order_data["total"],
+                            order_data["payment"], order_data.get("cash_tendered"),
+                            order_data.get("change"),
+                        )
+                    else:
+                        escpos_data = (b'\x1b\x40\x1b\x4d\x00'
+                                       + printable_invoice.encode("cp437", errors="replace")
+                                       + b'\n\n\n\n\x1d\x56\x42\x00')
+                    raw_ok, raw_detail = self._send_raw_to_printer(chosen_printer, escpos_data)
+                    if raw_ok:
                         ok = True
-                        detail = "Sent to default printer via system print handler."
+                        detail = raw_detail
+                    else:
+                        raise OSError(raw_detail)
+                except Exception as e2:
+                    err2 = str(e2)
+
+                    # Method 3: notepad /p (last resort)
+                    try:
+                        subprocess.run(["notepad.exe", "/p", txt_path],
+                                       check=True, timeout=30)
+                        ok = True
+                        detail = "Sent to printer via Notepad."
                     except Exception as e3:
                         detail = (
-                            f"RAW spooler: {detail}\n"
-                            f"Notepad fallback: {e2}\n"
-                            f"System print: {e3}"
+                            f"Out-Printer: {err1}\n"
+                            f"RAW: {err2}\n"
+                            f"Notepad: {e3}"
                         )
 
             if ok:
                 messagebox.showinfo(
                     "Print Sent",
                     f"Receipt sent to '{chosen_printer}'.\n{detail}\n\n"
-                    f"Invoice PDF saved as:\n{fname}"
+                    f"Invoice PDF saved as:\n{pdf_fname}"
                 )
             else:
                 messagebox.showerror(
                     "Print Failed",
                     f"Could not print to '{chosen_printer}'.\n\n{detail}\n\n"
-                    f"Invoice PDF was still saved as:\n{fname}"
+                    f"Invoice PDF was still saved as:\n{pdf_fname}"
                 )
 
         btn_row = ctk.CTkFrame(win, fg_color="transparent")
