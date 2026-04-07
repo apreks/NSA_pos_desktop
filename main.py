@@ -19,6 +19,11 @@ from tkinter import messagebox, ttk
 import tkinter as tk
 from reportlab.pdfgen import canvas
 from PIL import Image as PILImage, ImageTk
+try:
+    from escpos.printer import Usb as EscposUsb
+    HAS_ESCPOS = True
+except ImportError:
+    HAS_ESCPOS = False
 
 # ─────────────────────────────────────────────
 #  APP DATA DIRECTORY SETUP
@@ -2356,6 +2361,137 @@ class BlazeBiteApp(ctk.CTk):
             y -= line_h
         pdf.save()
 
+    # ── Direct USB printing via python-escpos ─
+
+    # Known Epson USB product IDs – extend as needed
+    _ESCPOS_USB_PROFILES = [
+        (0x04B8, 0x0E28),   # Epson TM-T20III
+        (0x04B8, 0x0202),   # Epson TM-T20II
+        (0x04B8, 0x0E15),   # Epson TM-T20II (alt)
+        (0x04B8, 0x0E03),   # Epson TM-T88V
+    ]
+
+    def _print_via_escpos(self, order_data: dict) -> tuple[bool, str]:
+        """Print receipt directly to USB thermal printer using python-escpos.
+
+        Tries each known VID/PID pair until a printer responds.
+        Returns (success, detail_message).
+        """
+        if not HAS_ESCPOS:
+            return False, "python-escpos library not installed."
+
+        items = order_data["items"]
+        subtotal = order_data["subtotal"]
+        tax = order_data["tax"]
+        total = order_data["total"]
+        payment = order_data["payment"]
+        cash_tendered = order_data.get("cash_tendered")
+        change = order_data.get("change")
+
+        W = self._get_receipt_profile(self._get_default_printer_name())["line_width"]
+        SEP = "=" * W
+        MID = "-" * W
+        now = datetime.datetime.now()
+
+        # Try each known VID/PID
+        p = None
+        used_id = None
+        for vid, pid in self._ESCPOS_USB_PROFILES:
+            try:
+                p = EscposUsb(vid, pid, in_ep=0x82, out_ep=0x01)
+                used_id = (vid, pid)
+                break
+            except Exception:
+                p = None
+                continue
+
+        if p is None:
+            return False, "No supported USB receipt printer found."
+
+        try:
+            # ── Init ──
+            p.hw("init")
+            p.set(font='a', width=1, height=1)
+            # Set print area to full 80mm width (576 dots = 0x0240)
+            p._raw(b'\x1d\x57\x40\x02')
+
+            # ── Header (centered) ──
+            p.set(align='center', font='a', width=1, height=1)
+            p.text(SEP + "\n")
+            p.set(align='center', font='a', width=2, height=2)
+            p.text(APP_NAME + "\n")
+            p.set(align='center', font='a', width=1, height=1)
+            p.text("Restaurant\n")
+            p.text("46 Patrice Lumumba Rd, Airport\n")
+            p.text("P.O. Box 46, State House - Accra\n")
+            p.text("GA-117-2059\n")
+            p.text(SEP + "\n")
+
+            # ── Order info (left-aligned) ──
+            p.set(align='left', font='a', width=1, height=1)
+            p.text(self._left_right("Date:", now.strftime("%Y-%m-%d"), W) + "\n")
+            p.text(self._left_right("Time:", now.strftime("%H:%M:%S"), W) + "\n")
+            p.text(self._left_right("Order:", f"#{self.order_counter:04d}", W) + "\n")
+            p.text(MID + "\n")
+
+            # ── Column header & items ──
+            qty_w = 4
+            amt_w = 12
+            name_w = W - qty_w - amt_w - 2
+
+            def item_row(n, q, a):
+                n = (n or "")[:name_w]
+                return f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}"
+
+            p.text(item_row("ITEM", "QTY", "AMOUNT") + "\n")
+            p.text(MID + "\n")
+
+            for it in items:
+                amt = it["price"] * it["qty"]
+                p.text(item_row(it["name"], it["qty"], f"GHS{amt:.2f}") + "\n")
+
+            p.text(MID + "\n")
+
+            # ── Totals ──
+            p.text(self._left_right("Subtotal:", f"GHS{subtotal:.2f}", W) + "\n")
+            tax_pct = TAX_RATE * 100
+            if tax_pct > 0:
+                p.text(self._left_right(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}", W) + "\n")
+            p.text(SEP + "\n")
+            p.set(align='left', font='a', width=2, height=1)
+            p.text(self._left_right("TOTAL:", f"GHS{total:.2f}", W // 2) + "\n")
+            p.set(align='left', font='a', width=1, height=1)
+            p.text(SEP + "\n")
+
+            # ── Payment ──
+            p.text(self._left_right("Payment:", payment, W) + "\n")
+            if payment == "Cash" and cash_tendered is not None and change is not None:
+                p.text(self._left_right("Cash Tendered:", f"GHS{cash_tendered:.2f}", W) + "\n")
+                p.text(self._left_right("Change:", f"GHS{change:.2f}", W) + "\n")
+
+            # ── Footer (centered) ──
+            p.text("\n")
+            p.set(align='center', font='a', width=1, height=1)
+            p.text("Thank You For Your Patronage\n")
+            p.text("See You Soon!\n")
+            p.text(SEP + "\n")
+
+            # ── Feed and cut ──
+            p.text("\n\n\n")
+            p.cut()
+
+            p.close()
+            vid_hex = f"0x{used_id[0]:04X}"
+            pid_hex = f"0x{used_id[1]:04X}"
+            return True, f"Printed via USB (python-escpos) [{vid_hex}:{pid_hex}]"
+
+        except Exception as e:
+            try:
+                p.close()
+            except Exception:
+                pass
+            return False, f"python-escpos error: {e}"
+
     def _show_invoice_window(self, invoice: str, order_data: dict | None = None):
         default_printer = self._get_default_printer_name()
         all_printers = self._enumerate_printers()
@@ -2449,62 +2585,66 @@ class BlazeBiteApp(ctk.CTk):
                 )
                 return
 
-            # Save receipt as text file for printing
-            txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(printable_invoice)
-
             ok = False
             detail = ""
 
-            # Method 1: PowerShell Out-Printer (uses Epson driver, respects paper size)
-            safe_printer = chosen_printer.replace("'", "''")
-            safe_path = txt_path.replace("'", "''")
-            try:
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     f"Get-Content -Path '{safe_path}' | Out-Printer -Name '{safe_printer}'"],
-                    check=True, timeout=15, capture_output=True,
-                )
-                ok = True
-                detail = "Sent to printer via Out-Printer."
-            except Exception as e1:
-                err1 = str(e1)
-
-                # Method 2: RAW ESC/POS (for thermal printers)
+            # Method 1: python-escpos direct USB (best for thermal printers)
+            if order_data and HAS_ESCPOS:
                 try:
-                    if order_data:
-                        escpos_data = self._build_escpos_receipt(
-                            order_data["items"], order_data["subtotal"],
-                            order_data["tax"], order_data["total"],
-                            order_data["payment"], order_data.get("cash_tendered"),
-                            order_data.get("change"),
-                        )
-                    else:
-                        escpos_data = (b'\x1b\x40\x1b\x4d\x00'
-                                       + printable_invoice.encode("cp437", errors="replace")
-                                       + b'\n\n\n\n\x1d\x56\x42\x00')
+                    escpos_ok, escpos_detail = self._print_via_escpos(order_data)
+                    if escpos_ok:
+                        ok = True
+                        detail = escpos_detail
+                except Exception as e0:
+                    detail = f"python-escpos: {e0}\n"
+
+            # Method 2: RAW ESC/POS via Windows spooler
+            if not ok and order_data:
+                try:
+                    escpos_data = self._build_escpos_receipt(
+                        order_data["items"], order_data["subtotal"],
+                        order_data["tax"], order_data["total"],
+                        order_data["payment"], order_data.get("cash_tendered"),
+                        order_data.get("change"),
+                    )
                     raw_ok, raw_detail = self._send_raw_to_printer(chosen_printer, escpos_data)
                     if raw_ok:
                         ok = True
                         detail = raw_detail
-                    else:
-                        raise OSError(raw_detail)
                 except Exception as e2:
-                    err2 = str(e2)
+                    detail += f"RAW spooler: {e2}\n"
 
-                    # Method 3: notepad /p (last resort)
-                    try:
-                        subprocess.run(["notepad.exe", "/p", txt_path],
-                                       check=True, timeout=30)
-                        ok = True
-                        detail = "Sent to printer via Notepad."
-                    except Exception as e3:
-                        detail = (
-                            f"Out-Printer: {err1}\n"
-                            f"RAW: {err2}\n"
-                            f"Notepad: {e3}"
-                        )
+            # Method 3: PowerShell Out-Printer (for non-thermal / office printers)
+            if not ok:
+                txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(printable_invoice)
+                safe_printer = chosen_printer.replace("'", "''")
+                safe_path = txt_path.replace("'", "''")
+                try:
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         f"Get-Content -Path '{safe_path}' | Out-Printer -Name '{safe_printer}'"],
+                        check=True, timeout=15, capture_output=True,
+                    )
+                    ok = True
+                    detail = "Sent to printer via Out-Printer."
+                except Exception as e3:
+                    detail += f"Out-Printer: {e3}\n"
+
+            # Method 4: notepad /p (last resort)
+            if not ok:
+                try:
+                    txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
+                    if not os.path.exists(txt_path):
+                        with open(txt_path, "w", encoding="utf-8") as f:
+                            f.write(printable_invoice)
+                    subprocess.run(["notepad.exe", "/p", txt_path],
+                                   check=True, timeout=30)
+                    ok = True
+                    detail = "Sent to printer via Notepad."
+                except Exception as e4:
+                    detail += f"Notepad: {e4}"
 
             if ok:
                 messagebox.showinfo(
