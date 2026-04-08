@@ -2185,19 +2185,46 @@ class BlazeBiteApp(ctk.CTk):
         so the hardware renders each line correctly regardless of margins,
         character pitch, or firmware differences.
         """
-        W = self._get_receipt_profile(self._get_default_printer_name())["line_width"]
+        profile = self._get_receipt_profile(self._get_default_printer_name())
+        W = profile["line_width"]
+        mm = profile["mm"]
         buf = bytearray()
 
         # ── Printer init ──
         buf += b'\x1b\x40'            # ESC @  – reset to defaults
         buf += b'\x1b\x4d\x00'        # ESC M 0 – Font A (widest)
-        buf += b'\x1b\x74\x00'        # ESC t 0 – code page PC437
+        buf += b'\x1b\x74\x02'        # ESC t 2 – code page 850 (better char coverage)
+
+        # ── Set full print area (critical for avoiding narrow/centered output) ──
+        buf += b'\x1d\x4c\x00\x00'  # GS L  – left margin = 0 dots
+        # GS W nL nH – print area width in dots (203 DPI: 1mm ≈ 8 dots)
+        # 80mm paper: 72mm printable = 576 dots (0x0240)
+        # 58mm paper: 48mm printable = 384 dots (0x0180)
+        if mm == 58:
+            buf += b'\x1d\x57\x80\x01'  # 384 dots
+        else:
+            buf += b'\x1d\x57\x40\x02'  # 576 dots
+        buf += b'\x1b\x33\x1e'        # ESC 3 30 – line spacing = 30 dots (tight)
 
         SEP = ("=" * W).encode("cp437")
         MID = ("-" * W).encode("cp437")
 
         def _enc(s: str) -> bytes:
             return s.encode("cp437", errors="replace")
+
+        # ── Text helpers with bold/size support ──
+        def _set_bold(on: bool):
+            buf.extend(b'\x1b\x45\x01' if on else b'\x1b\x45\x00')
+
+        def _set_double(w: bool = False, h: bool = False):
+            mode = 0
+            if w:
+                mode |= 0x20
+            if h:
+                mode |= 0x10
+            buf.extend(b'\x1d\x21' + bytes([mode]))  # GS ! – character size
+            # NOTE: Do NOT send ESC ! here — it conflicts with GS ! on Epson
+            # printers (last command wins) and would cancel double-size.
 
         def center(text: str):
             buf.extend(b'\x1b\x61\x01')    # ESC a 1 – center
@@ -2224,14 +2251,20 @@ class BlazeBiteApp(ctk.CTk):
             gap = max(1, W - len(l) - len(r))
             left(l + " " * gap + r)
 
-        # ── Header (centered) ──
-        center("=" * W)
+        # ── Header (centered, double-size store name) ──
+        _set_bold(True)
+        _set_double(w=True, h=True)
         center(APP_NAME)
+
+        # FIX: explicitly reset BOTH dimensions + bold before separator/address
+        _set_double(w=False, h=False)
+        _set_bold(False)
+
         center("Restaurant")
         center("46 Patrice Lumumba Rd, Airport")
         center("P.O. Box 46, State House - Accra")
         center("GA-117-2059")
-        center("=" * W)
+        left_sep()   # safe: font is fully reset before this line
 
         # ── Order info (left-aligned) ──
         now = datetime.datetime.now()
@@ -2249,7 +2282,9 @@ class BlazeBiteApp(ctk.CTk):
             n = (n or "")[:name_w]
             left(f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}")
 
+        _set_bold(True)
         item_line("ITEM", "QTY", "AMOUNT")
+        _set_bold(False)
         left_mid()
 
         for it in items:
@@ -2264,7 +2299,11 @@ class BlazeBiteApp(ctk.CTk):
         if tax_pct > 0:
             lr(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}")
         left_sep()
+
+        # FIX: bold only — no double-wide — avoids W // 2 math error
+        _set_bold(True)
         lr("TOTAL:", f"GHS{total:.2f}")
+        _set_bold(False)
         left_sep()
 
         # ── Payment ──
@@ -2277,10 +2316,10 @@ class BlazeBiteApp(ctk.CTk):
         left("")
         center("Thank You For Your Patronage")
         center("See You Soon!")
-        center("=" * W)
+        left_sep()
 
         # ── Feed and cut ──
-        buf += b'\n\n\n\n'             # feed past tear bar
+        buf += b'\n\n\n'               # feed 3 lines past tear bar
         buf += b'\x1d\x56\x42\x00'    # GS V 66 0 – partial cut (most compatible)
 
         return bytes(buf)
@@ -2410,29 +2449,34 @@ class BlazeBiteApp(ctk.CTk):
 
         try:
             # ── Init ──
-            p.hw("init")
-            p.set(font='a', width=1, height=1)
-            # Set print area to full 80mm width (576 dots = 0x0240)
-            p._raw(b'\x1d\x57\x40\x02')
+            p.charcode('AUTO')
 
-            # ── Header (centered) ──
-            p.set(align='center', font='a', width=1, height=1)
-            p.text(SEP + "\n")
-            p.set(align='center', font='a', width=2, height=2)
-            p.text(APP_NAME + "\n")
-            p.set(align='center', font='a', width=1, height=1)
-            p.text("Restaurant\n")
-            p.text("46 Patrice Lumumba Rd, Airport\n")
-            p.text("P.O. Box 46, State House - Accra\n")
-            p.text("GA-117-2059\n")
-            p.text(SEP + "\n")
+            # ── Set full print area (critical for avoiding narrow/centered output) ──
+            p._raw(b'\x1d\x4c\x00\x00')  # GS L  – left margin = 0 dots
+            # GS W – print area width: 576 dots for 80mm, 384 dots for 58mm
+            if self._get_receipt_profile(self._get_default_printer_name())["mm"] == 58:
+                p._raw(b'\x1d\x57\x80\x01')  # 384 dots
+            else:
+                p._raw(b'\x1d\x57\x40\x02')  # 576 dots (full 80mm)
+            p._raw(b'\x1b\x33\x1e')            # ESC 3 30 – tight line spacing
+
+            # ── Header (centered, double-size store name) ──
+            p.set(align='center', bold=True, width=2, height=2)
+            p.textln(APP_NAME)
+
+            p.set(align='center', bold=False, width=1, height=1)
+            p.textln("Restaurant")
+            p.textln("46 Patrice Lumumba Rd, Airport")
+            p.textln("P.O. Box 46, State House - Accra")
+            p.textln("GA-117-2059")
+            p.textln(SEP)
 
             # ── Order info (left-aligned) ──
-            p.set(align='left', font='a', width=1, height=1)
-            p.text(self._left_right("Date:", now.strftime("%Y-%m-%d"), W) + "\n")
-            p.text(self._left_right("Time:", now.strftime("%H:%M:%S"), W) + "\n")
-            p.text(self._left_right("Order:", f"#{self.order_counter:04d}", W) + "\n")
-            p.text(MID + "\n")
+            p.set(align='left', bold=False, width=1, height=1)
+            p.textln(self._left_right("Date:", now.strftime("%Y-%m-%d"), W))
+            p.textln(self._left_right("Time:", now.strftime("%H:%M:%S"), W))
+            p.textln(self._left_right("Order:", f"#{self.order_counter:04d}", W))
+            p.textln(MID)
 
             # ── Column header & items ──
             qty_w = 4
@@ -2443,41 +2487,47 @@ class BlazeBiteApp(ctk.CTk):
                 n = (n or "")[:name_w]
                 return f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}"
 
-            p.text(item_row("ITEM", "QTY", "AMOUNT") + "\n")
-            p.text(MID + "\n")
+            p.set(align='left', bold=True, width=1, height=1)
+            p.textln(item_row("ITEM", "QTY", "AMOUNT"))
+            p.textln(MID)
 
+            p.set(align='left', bold=False, width=1, height=1)
             for it in items:
                 amt = it["price"] * it["qty"]
-                p.text(item_row(it["name"], it["qty"], f"GHS{amt:.2f}") + "\n")
+                p.textln(item_row(it["name"], it["qty"], f"GHS{amt:.2f}"))
 
-            p.text(MID + "\n")
+            p.textln(MID)
 
             # ── Totals ──
-            p.text(self._left_right("Subtotal:", f"GHS{subtotal:.2f}", W) + "\n")
+            p.set(align='left', bold=False, width=1, height=1)
+            p.textln(self._left_right("Subtotal:", f"GHS{subtotal:.2f}", W))
             tax_pct = TAX_RATE * 100
             if tax_pct > 0:
-                p.text(self._left_right(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}", W) + "\n")
-            p.text(SEP + "\n")
-            p.set(align='left', font='a', width=2, height=1)
-            p.text(self._left_right("TOTAL:", f"GHS{total:.2f}", W // 2) + "\n")
-            p.set(align='left', font='a', width=1, height=1)
-            p.text(SEP + "\n")
+                p.textln(self._left_right(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}", W))
+            p.textln(SEP)
+
+            # FIX: bold only — NOT width=2 — so _left_right uses correct full W
+            p.set(align='left', bold=True, width=1, height=1)
+            p.textln(self._left_right("TOTAL:", f"GHS{total:.2f}", W))
+
+            p.set(align='left', bold=False, width=1, height=1)
+            p.textln(SEP)
 
             # ── Payment ──
-            p.text(self._left_right("Payment:", payment, W) + "\n")
+            p.textln(self._left_right("Payment:", payment, W))
             if payment == "Cash" and cash_tendered is not None and change is not None:
-                p.text(self._left_right("Cash Tendered:", f"GHS{cash_tendered:.2f}", W) + "\n")
-                p.text(self._left_right("Change:", f"GHS{change:.2f}", W) + "\n")
+                p.textln(self._left_right("Cash Tendered:", f"GHS{cash_tendered:.2f}", W))
+                p.textln(self._left_right("Change:", f"GHS{change:.2f}", W))
 
             # ── Footer (centered) ──
-            p.text("\n")
-            p.set(align='center', font='a', width=1, height=1)
-            p.text("Thank You For Your Patronage\n")
-            p.text("See You Soon!\n")
-            p.text(SEP + "\n")
+            p.set(align='center', bold=False, width=1, height=1)
+            p.textln("")
+            p.textln("Thank You For Your Patronage")
+            p.textln("See You Soon!")
+            p.textln(SEP)
 
             # ── Feed and cut ──
-            p.text("\n\n\n")
+            p.ln(3)
             p.cut()
 
             p.close()
