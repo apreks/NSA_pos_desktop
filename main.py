@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import ctypes
+import threading
 from ctypes import wintypes
 from tkinter import messagebox, ttk
 import tkinter as tk
@@ -117,18 +118,20 @@ MENU = {
 }
 
 COLD_STORE_MENU = {
-    "🥩 Meat": [
-        {"name": "Fresh Chicken",     "price": 450.00, "desc": "Whole chicken, farm fresh"},
-        {"name": "Beef Cuts",        "price": 620.00, "desc": "Assorted steaks & roasts"},
-        {"name": "Pork Shoulder",    "price": 510.00, "desc": "Great for slow cooking"},
+    "🍗 Chicken": [
+        {"name": "Frozen Chicken",   "price": 120.00, "desc": "Whole frozen chicken"},
+        {"name": "Live Chicken",     "price": 100.00, "desc": "Live chicken"},
     ],
     "🥚 Eggs": [
-        {"name": "Farm Eggs (dozen)","price": 95.00,  "desc": "Free-range, grade A"},
-        {"name": "Quail Eggs (dozen)","price": 120.00, "desc": "Rich flavor, gourmet"},
+        {"name": "Eggs (Crate)",     "price": 50.00,  "desc": "Full crate of eggs"},
+        {"name": "Eggs (Tray)",      "price": 45.00,  "desc": "Single tray of eggs"},
     ],
-    "🍗 Poultry": [
-        {"name": "Turkey Breast",     "price": 520.00, "desc": "Lean & tender"},
-        {"name": "Duck Legs",        "price": 580.00, "desc": "Rich flavor, perfect for roasting"},
+    "🥩 Meat": [
+        {"name": "Turkey",           "price": 1500.00, "desc": "Whole turkey"},
+        {"name": "Pork (Pig)",       "price": 1500.00, "desc": "Whole pig"},
+    ],
+    "🐟 Fish": [
+        {"name": "Catfish",          "price": 80.00,  "desc": "Fresh catfish"},
     ],
 }
 
@@ -2358,9 +2361,7 @@ class BlazeBiteApp(ctk.CTk):
 
         # ── Header ──
         _set_bold(True)
-        _set_double(w=True, h=True)
         center(biz["name"])
-        _set_double(w=False, h=False)
         _set_bold(False)
 
         center(biz["tagline"])
@@ -2598,7 +2599,7 @@ class BlazeBiteApp(ctk.CTk):
             p._raw(b'\x1b\x33\x1e')          # ESC 3 30 – tight line spacing
 
             # ── Header ──
-            p.set(align='center', bold=True, width=2, height=2)
+            p.set(align='center', bold=True, width=1, height=1)
             p.textln(biz["name"])
 
             p.set(align='center', bold=False, width=1, height=1)
@@ -2792,94 +2793,105 @@ class BlazeBiteApp(ctk.CTk):
         status_lbl.pack(pady=(2, 0))
 
         def _do_print():
-            """Save receipt as PDF, then print via ESC/POS or PDF fallback."""
-            app_data_dir = get_app_data_dir()
+            """Print receipt: try fast ESC/POS first, fall back to PDF."""
             chosen_printer = printer_var.get().strip()
-
-            # ── Step 1: Save PDF to disk (archive copy) ──
-            pdf_path = os.path.join(app_data_dir, f"receipt_{order_num:04d}.pdf")
-            self._save_invoice_pdf(invoice, pdf_path, order_data)
-            status_var.set(f"Saved: {pdf_path}")
-            win.update_idletasks()
 
             if not chosen_printer or chosen_printer == "(No printers found)":
                 messagebox.showerror(
                     "Printer Not Detected",
                     "No printer was selected or detected.\n"
                     "Connect a printer, set it as default,\n"
-                    "then click ⟳ to refresh.\n\n"
-                    f"Receipt PDF saved as:\n{pdf_path}"
+                    "then click ⟳ to refresh."
                 )
                 return
 
             status_var.set("Sending to printer...")
             win.update_idletasks()
 
-            ok = False
-            detail = ""
+            def _print_worker():
+                ok = False
+                detail = ""
 
-            # ── Step 2: Try ESC/POS first (thermal receipt printers) ──
+                # ── Fast path: ESC/POS (thermal receipt printers) ──
 
-            # Method 1: python-escpos direct USB
-            if order_data and HAS_ESCPOS:
-                try:
-                    escpos_ok, escpos_detail = self._print_via_escpos(order_data)
-                    if escpos_ok:
-                        ok, detail = True, escpos_detail
+                # Method 1: python-escpos direct USB
+                if order_data and HAS_ESCPOS:
+                    try:
+                        escpos_ok, escpos_detail = self._print_via_escpos(order_data)
+                        if escpos_ok:
+                            ok, detail = True, escpos_detail
+                        else:
+                            detail += f"python-escpos: {escpos_detail}\n"
+                    except Exception as e0:
+                        detail += f"python-escpos: {e0}\n"
+
+                # Method 2: RAW ESC/POS via Windows spooler
+                if not ok and order_data:
+                    try:
+                        escpos_data = self._build_escpos_receipt(order_data)
+                        raw_ok, raw_detail = self._send_raw_to_printer(chosen_printer, escpos_data)
+                        if raw_ok:
+                            ok, detail = True, raw_detail
+                        else:
+                            detail += f"RAW spooler: {raw_detail}\n"
+                    except Exception as e2:
+                        detail += f"RAW spooler: {e2}\n"
+
+                # ── Slow path: generate PDF only if ESC/POS failed ──
+                pdf_path = None
+                if not ok:
+                    app_data_dir = get_app_data_dir()
+                    pdf_path = os.path.join(app_data_dir, f"receipt_{order_num:04d}.pdf")
+                    self._save_invoice_pdf(invoice, pdf_path, order_data)
+
+                    # Method 3: Print PDF via Windows shell "printto"
+                    try:
+                        ret = ctypes.windll.shell32.ShellExecuteW(
+                            None, "printto", pdf_path, f'"{chosen_printer}"', ".", 0
+                        )
+                        if ret > 32:
+                            ok, detail = True, "PDF sent via ShellExecute printto."
+                        else:
+                            detail += f"ShellExecute printto returned {ret}\n"
+                    except Exception as e3:
+                        detail += f"ShellExecute: {e3}\n"
+
+                    # Method 4: Print PDF via os.startfile (default printer)
+                    if not ok:
+                        try:
+                            os.startfile(pdf_path, "print")
+                            ok, detail = True, "PDF sent via default PDF handler."
+                        except Exception as e4:
+                            detail += f"os.startfile: {e4}\n"
+
+                # ── Save PDF archive in background (non-blocking) ──
+                if ok and pdf_path is None:
+                    try:
+                        app_data_dir = get_app_data_dir()
+                        pdf_path = os.path.join(app_data_dir, f"receipt_{order_num:04d}.pdf")
+                        self._save_invoice_pdf(invoice, pdf_path, order_data)
+                    except Exception:
+                        pass
+
+                # ── Report result back on the UI thread ──
+                final_pdf = pdf_path
+                def _on_done():
+                    if ok:
+                        status_var.set(f"✅ {detail}")
+                        messagebox.showinfo(
+                            "Print Sent",
+                            f"Receipt sent to '{chosen_printer}'.\n{detail}"
+                        )
                     else:
-                        detail += f"python-escpos: {escpos_detail}\n"
-                except Exception as e0:
-                    detail += f"python-escpos: {e0}\n"
+                        status_var.set("❌ Print failed — see error dialog")
+                        msg = f"Could not print to '{chosen_printer}'.\n\n{detail}"
+                        if final_pdf:
+                            msg += f"\n\nPDF saved: {final_pdf}"
+                        messagebox.showerror("Print Failed", msg)
 
-            # Method 2: RAW ESC/POS via Windows spooler
-            if not ok and order_data:
-                try:
-                    escpos_data = self._build_escpos_receipt(order_data)
-                    raw_ok, raw_detail = self._send_raw_to_printer(chosen_printer, escpos_data)
-                    if raw_ok:
-                        ok, detail = True, raw_detail
-                    else:
-                        detail += f"RAW spooler: {raw_detail}\n"
-                except Exception as e2:
-                    detail += f"RAW spooler: {e2}\n"
+                win.after(0, _on_done)
 
-            # ── Step 3: PDF fallback (office / non-thermal printers) ──
-
-            # Method 3: Print PDF via Windows shell "printto"
-            if not ok:
-                try:
-                    ret = ctypes.windll.shell32.ShellExecuteW(
-                        None, "printto", pdf_path, f'"{chosen_printer}"', ".", 0
-                    )
-                    if ret > 32:
-                        ok, detail = True, "PDF sent via ShellExecute printto."
-                    else:
-                        detail += f"ShellExecute printto returned {ret}\n"
-                except Exception as e3:
-                    detail += f"ShellExecute: {e3}\n"
-
-            # Method 4: Print PDF via os.startfile (default printer)
-            if not ok:
-                try:
-                    os.startfile(pdf_path, "print")
-                    ok, detail = True, "PDF sent via default PDF handler."
-                except Exception as e4:
-                    detail += f"os.startfile: {e4}\n"
-
-            if ok:
-                status_var.set(f"✅ {detail}")
-                messagebox.showinfo(
-                    "Print Sent",
-                    f"Receipt sent to '{chosen_printer}'.\n{detail}\n\n"
-                    f"PDF saved: {pdf_path}"
-                )
-            else:
-                status_var.set("❌ Print failed — see error dialog")
-                messagebox.showerror(
-                    "Print Failed",
-                    f"Could not print to '{chosen_printer}'.\n\n{detail}\n\n"
-                    f"PDF saved: {pdf_path}"
-                )
+            threading.Thread(target=_print_worker, daemon=True).start()
 
         def _save_text_copy():
             """Save receipt as .txt in the app data folder and notify."""
@@ -3252,20 +3264,14 @@ class BlazeBiteApp(ctk.CTk):
                      font=ctk.CTkFont("Helvetica", 11, "bold"),
                      text_color=COLORS["text_secondary"]).pack(side="left", padx=(4, 8))
 
-        self.admin_items_store_var = tk.StringVar(value="All")
-        ctk.CTkComboBox(
+        # Lock admin to their own store
+        own_store_label = STORE_LABELS.get(self.active_store, "All")
+        self.admin_items_store_var = tk.StringVar(value=own_store_label)
+        ctk.CTkLabel(
             admin_items_filter_row,
-            width=150,
-            height=30,
-            values=["All", "Fast Food", "Cold Store"],
-            variable=self.admin_items_store_var,
-            command=lambda _v: self._on_admin_items_store_change(),
-            fg_color=COLORS["bg_hover"],
-            border_color=COLORS["border"],
-            text_color=COLORS["text_primary"],
-            dropdown_fg_color=COLORS["bg_card"],
-            dropdown_text_color=COLORS["text_primary"],
-            font=ctk.CTkFont("Helvetica", 11),
+            text=own_store_label,
+            font=ctk.CTkFont("Helvetica", 11, "bold"),
+            text_color=COLORS["accent"],
         ).pack(side="left")
 
         admin_item_cols = ("Store", "Category", "Item", "Price (₵)", "Stock", "Status")
@@ -4840,10 +4846,11 @@ class BlazeBiteApp(ctk.CTk):
 
     def _refresh_item_report_items(self):
         """Update the item combo-box list for the current user's access scope."""
-        if self.current_role in ("admin", "root_admin"):
+        if self.current_role == "root_admin":
             names = sorted({row[2] for row in self.db.get_all_products(store=None)})
         else:
-            names = self.db.get_all_item_names(store=self.active_store)
+            # admin and attendant see only their own store's items
+            names = sorted({row[2] for row in self.db.get_all_products(store=self.active_store)})
         self.report_item_combo.configure(values=names if names else ["(no transactions yet)"])
         if names and not self.report_item_var.get():
             self.report_item_var.set(names[0])
