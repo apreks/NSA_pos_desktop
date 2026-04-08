@@ -39,10 +39,25 @@ def get_app_data_dir():
 #  APP SETTINGS
 # ─────────────────────────────────────────────
 APP_NAME = "NSA POINT OF SALE"
-TAX_RATE = 0.00 # No tax for fast food in this scenario
+DEFAULT_TAX_RATE = 0.15  # 15% tax – overridden by admin setting
 DB_FILE = os.path.join(get_app_data_dir(), "blazebite.db")
 SETTINGS_FILE = os.path.join(get_app_data_dir(), "settings.json")
 ADMIN_PASSWORD = "admin123"
+
+# ─────────────────────────────────────────────
+#  BUSINESS / RECEIPT HEADER INFO
+# ─────────────────────────────────────────────
+BUSINESS_INFO = {
+    "name":           "NSA RESTAURANT",
+    "tagline":        "Point of Sale",
+    "address_line1":  "46 Patrice Lumumba Rd, Airport",
+    "address_line2":  "P.O. Box 46, State House - Accra",
+    "digital_addr":   "GA-117-2059",
+    "phone":          "",          # e.g. "030-XXX-XXXX"
+    "tin":            "",          # Tax Identification Number
+    "footer_line1":   "Thank You For Your Patronage",
+    "footer_line2":   "See You Soon!",
+}
 
 # ─────────────────────────────────────────────
 #  COLOUR PALETTE  (Modern, Fluid, Vibrant)
@@ -1071,6 +1086,7 @@ class BlazeBiteApp(ctk.CTk):
         self.order_counter = 1001
         self.active_category = None
         self.receipt_paper_profile = "Auto"  # Auto | 80mm | 58mm
+        self.tax_rate = DEFAULT_TAX_RATE
         self._load_app_settings()
 
         # ── Cloud sync (local-first, sync on demand) ──
@@ -1098,15 +1114,26 @@ class BlazeBiteApp(ctk.CTk):
             profile = str(data.get("receipt_paper_profile", "Auto")).strip()
             if profile in ("Auto", "80mm", "58mm"):
                 self.receipt_paper_profile = profile
+            # Tax rate
+            saved_tax = data.get("tax_rate")
+            if saved_tax is not None:
+                try:
+                    val = float(saved_tax)
+                    if 0.0 <= val <= 1.0:
+                        self.tax_rate = val
+                except (ValueError, TypeError):
+                    pass
         except Exception:
             # Keep defaults when settings are missing/corrupt.
             self.receipt_paper_profile = "Auto"
+            self.tax_rate = DEFAULT_TAX_RATE
 
     def _save_app_settings(self):
         """Persist app settings to disk."""
         try:
             data = {
                 "receipt_paper_profile": self.receipt_paper_profile,
+                "tax_rate": self.tax_rate,
             }
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -1136,6 +1163,38 @@ class BlazeBiteApp(ctk.CTk):
             self.root_receipt_profile_var.set(selected)
 
         self._save_app_settings()
+
+    def _on_tax_rate_changed(self):
+        """Apply admin-entered tax rate and update UI."""
+        raw = self._admin_tax_var.get().strip().replace("%", "")
+        try:
+            pct = float(raw)
+        except ValueError:
+            self._admin_tax_status.configure(
+                text="Invalid number", text_color=COLORS["error"])
+            return
+        if pct < 0 or pct > 100:
+            self._admin_tax_status.configure(
+                text="Must be 0–100%", text_color=COLORS["error"])
+            return
+
+        self.tax_rate = round(pct / 100.0, 4)
+        self._save_app_settings()
+
+        # Update the order panel tax label
+        if hasattr(self, "tax_lbl"):
+            # Find the label text widget on the left side of the tax row
+            parent_row = self.tax_lbl.master
+            for child in parent_row.winfo_children():
+                if child is not self.tax_lbl:
+                    child.configure(text=f"Tax ({pct:.0f}%)")
+                    break
+
+        # Refresh totals so the new rate takes effect immediately
+        self._refresh_order_panel()
+
+        self._admin_tax_status.configure(
+            text=f"Current: {pct:.1f}%", text_color=COLORS["text_muted"])
 
     def _build_layout(self):
         # Top bar
@@ -1703,7 +1762,7 @@ class BlazeBiteApp(ctk.CTk):
 
         for label_attr, val_attr, color in [
             ("Subtotal",  "sub_lbl",   COLORS["text_secondary"]),
-            ("Tax (15%)", "tax_lbl",   COLORS["text_secondary"]),
+            (f"Tax ({self.tax_rate*100:.0f}%)", "tax_lbl",   COLORS["text_secondary"]),
             ("TOTAL",     "total_lbl", COLORS["accent_glow"]),
         ]:
             row = ctk.CTkFrame(totals_frame, fg_color="transparent")
@@ -1820,6 +1879,7 @@ class BlazeBiteApp(ctk.CTk):
 
     def _clear_order(self):
         self.order_items.clear()
+        self.cash_tendered_var.set("")
         self._refresh_order_panel()
 
     def _refresh_order_panel(self):
@@ -1839,7 +1899,7 @@ class BlazeBiteApp(ctk.CTk):
 
         # Recalculate totals
         subtotal = sum(d["price"] * d["qty"] for d in self.order_items.values())
-        tax      = subtotal * TAX_RATE
+        tax      = subtotal * self.tax_rate
         total    = subtotal + tax
 
         self.sub_lbl.configure(text=f"₵{subtotal:.2f}")
@@ -1876,7 +1936,7 @@ class BlazeBiteApp(ctk.CTk):
             return
 
         subtotal = sum(d["price"] * d["qty"] for d in self.order_items.values())
-        tax = subtotal * TAX_RATE
+        tax = subtotal * self.tax_rate
         total = subtotal + tax
         cash_tendered = self._parse_cash_tendered()
 
@@ -1946,7 +2006,7 @@ class BlazeBiteApp(ctk.CTk):
             return
 
         subtotal = sum(d["price"] * d["qty"] for d in self.order_items.values())
-        tax      = subtotal * TAX_RATE
+        tax      = subtotal * self.tax_rate
         total    = subtotal + tax
         payment  = self.payment_var.get()
         cash_tendered = None
@@ -1985,14 +2045,18 @@ class BlazeBiteApp(ctk.CTk):
         )
 
         # Generate invoice
-        invoice = self._build_invoice(items_list, subtotal, tax, total, payment, cash_tendered, change)
-
-        # Show invoice window (pass order data for ESC/POS printing)
         order_data = {
             "items": items_list, "subtotal": subtotal, "tax": tax,
             "total": total, "payment": payment,
             "cash_tendered": cash_tendered, "change": change,
+            "order_number": self.order_counter,
+            "cashier": self.current_user or "—",
+            "store": STORE_LABELS.get(self.active_store, self.active_store or "—"),
+            "timestamp": datetime.datetime.now(),
         }
+        invoice = self._build_invoice(order_data)
+
+        # Show invoice window (pass order data for ESC/POS printing)
         self._show_invoice_window(invoice, order_data)
 
         # Reset
@@ -2085,6 +2149,8 @@ class BlazeBiteApp(ctk.CTk):
 
     # ── Text receipt builder ──────────────────
 
+    # ── Text helpers ────────────────────────
+
     @staticmethod
     def _center(text: str, w: int) -> str:
         t = (text or "").strip()
@@ -2099,112 +2165,156 @@ class BlazeBiteApp(ctk.CTk):
             gap = 1
         return left + " " * gap + right
 
-    def _build_invoice(self, items, subtotal, tax, total, payment,
-                       cash_tendered=None, change=None,
+    @staticmethod
+    def _fmt_money(amount: float, prefix: str = "GHS") -> str:
+        """Format money with commas: 1234.56 -> 'GHS1,234.56'."""
+        return f"{prefix}{amount:,.2f}"
+
+    def _build_invoice(self, order_data: dict,
                        printer_name: str | None = None) -> str:
+        """Build a plain-text receipt from *order_data* dict.
+
+        order_data keys:
+            items, subtotal, tax, total, payment,
+            cash_tendered, change, order_number, cashier, store, timestamp
+        """
         printer_name = printer_name or self._get_default_printer_name()
         W = self._get_receipt_profile(printer_name)["line_width"]
 
-        now = datetime.datetime.now()
+        items          = order_data["items"]
+        subtotal       = order_data["subtotal"]
+        tax            = order_data["tax"]
+        total          = order_data["total"]
+        payment        = order_data["payment"]
+        cash_tendered  = order_data.get("cash_tendered")
+        change         = order_data.get("change")
+        order_number   = order_data.get("order_number", self.order_counter)
+        cashier        = order_data.get("cashier", "—")
+        store          = order_data.get("store", "—")
+        now            = order_data.get("timestamp") or datetime.datetime.now()
+
+        biz = BUSINESS_INFO
         SEP = "=" * W
         MID = "-" * W
+        fm  = self._fmt_money
 
         lines: list[str] = []
-        c = self._center
+        c  = self._center
         lr = self._left_right
 
         # ── Header ──
         lines.append(SEP)
-        lines.append(c(f"{APP_NAME}", W))
-        lines.append(c("Restaurant", W))
-        lines.append(c("46 Patrice Lumumba Rd, Airport", W))
-        lines.append(c("P.O. Box 46, State House - Accra", W))
-        lines.append(c("GA-117-2059", W))
+        lines.append(c(biz["name"], W))
+        lines.append(c(biz["tagline"], W))
+        lines.append(c(biz["address_line1"], W))
+        lines.append(c(biz["address_line2"], W))
+        lines.append(c(biz["digital_addr"], W))
+        if biz.get("phone"):
+            lines.append(c(f"Tel: {biz['phone']}", W))
+        if biz.get("tin"):
+            lines.append(c(f"TIN: {biz['tin']}", W))
         lines.append(SEP)
 
         # ── Order info ──
         lines.append(lr("Date:", now.strftime("%Y-%m-%d"), W))
         lines.append(lr("Time:", now.strftime("%H:%M:%S"), W))
-        lines.append(lr("Order:", f"#{self.order_counter:04d}", W))
+        lines.append(lr("Order:", f"#{order_number:04d}", W))
+        lines.append(lr("Cashier:", cashier, W))
+        lines.append(lr("Store:", store, W))
         lines.append(MID)
 
-        # ── Column header ──
-        # Use a 3-column layout: ITEM | QTY | AMOUNT
-        qty_w = 4
-        amt_w = 12
-        name_w = W - qty_w - amt_w - 2          # 2 spaces for gaps
+        # ── Column header: ITEM | QTY | PRICE | AMOUNT ──
+        qty_w  = 3
+        prc_w  = 8   # unit price  e.g. " 139.35"
+        amt_w  = 10   # line total  e.g. " 1,234.56"
+        name_w = W - qty_w - prc_w - amt_w - 3   # 3 gaps
 
-        def item_row(n: str, q, a: str) -> str:
+        def item_row(n: str, q, p: str, a: str) -> str:
             n = (n or "")[:name_w]
-            return f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}"
+            return f"{n:<{name_w}} {str(q):>{qty_w}} {p:>{prc_w}} {a:>{amt_w}}"
 
-        lines.append(item_row("ITEM", "QTY", "AMOUNT"))
+        lines.append(item_row("ITEM", "QTY", "PRICE", "AMOUNT"))
         lines.append(MID)
 
         # ── Items ──
+        total_qty = 0
         for it in items:
             amt = it["price"] * it["qty"]
-            lines.append(item_row(it["name"], it["qty"], f"GHS{amt:.2f}"))
+            total_qty += it["qty"]
+            lines.append(item_row(
+                it["name"],
+                it["qty"],
+                f"{it['price']:,.2f}",
+                f"{amt:,.2f}",
+            ))
 
         lines.append(MID)
 
-        # ── Totals ──
-        lines.append(lr("Subtotal:", f"GHS{subtotal:.2f}", W))
-        tax_pct = TAX_RATE * 100
+        # ── Summary ──
+        lines.append(lr(f"Items: {total_qty}", f"Subtotal: {fm(subtotal)}", W))
+        tax_pct = self.tax_rate * 100
         if tax_pct > 0:
-            lines.append(lr(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}", W))
+            lines.append(lr("", f"Tax ({tax_pct:.0f}%): {fm(tax)}", W))
         lines.append(SEP)
-        lines.append(lr("TOTAL:", f"GHS{total:.2f}", W))
+        lines.append(lr("TOTAL:", fm(total), W))
         lines.append(SEP)
 
         # ── Payment ──
         lines.append(lr("Payment:", payment, W))
         if payment == "Cash" and cash_tendered is not None and change is not None:
-            lines.append(lr("Cash Tendered:", f"GHS{cash_tendered:.2f}", W))
-            lines.append(lr("Change:", f"GHS{change:.2f}", W))
+            lines.append(lr("Tendered:", fm(cash_tendered), W))
+            lines.append(lr("Change:", fm(change), W))
+        lines.append(MID)
 
         # ── Footer ──
         lines.append("")
-        lines.append(c("Thank You For Your Patronage", W))
-        lines.append(c("See You Soon!", W))
+        lines.append(c(biz["footer_line1"], W))
+        lines.append(c(biz["footer_line2"], W))
         lines.append(SEP)
 
         return "\n".join(lines)
 
     # ── ESC/POS receipt builder (hardware-aligned) ─
 
-    def _build_escpos_receipt(self, items, subtotal, tax, total, payment,
-                              cash_tendered=None, change=None) -> bytes:
+    def _build_escpos_receipt(self, order_data: dict) -> bytes:
         """Build an ESC/POS byte stream that prints correctly on any
         thermal receipt printer (Epson, Star, Bixolon, generic POS, etc.).
 
-        Instead of space-padding text and hoping the column count matches,
-        this uses the printer's own alignment commands:
-          ESC a 0 = left-align
-          ESC a 1 = center-align
-        so the hardware renders each line correctly regardless of margins,
-        character pitch, or firmware differences.
+        Uses the printer's own alignment commands (ESC a) and BUSINESS_INFO
+        dict so the layout stays in sync with _build_invoice.
         """
         profile = self._get_receipt_profile(self._get_default_printer_name())
         W = profile["line_width"]
         mm = profile["mm"]
+
+        items          = order_data["items"]
+        subtotal       = order_data["subtotal"]
+        tax            = order_data["tax"]
+        total          = order_data["total"]
+        payment        = order_data["payment"]
+        cash_tendered  = order_data.get("cash_tendered")
+        change         = order_data.get("change")
+        order_number   = order_data.get("order_number", self.order_counter)
+        cashier        = order_data.get("cashier", "—")
+        store          = order_data.get("store", "—")
+        now            = order_data.get("timestamp") or datetime.datetime.now()
+
+        biz = BUSINESS_INFO
+        fm  = self._fmt_money
         buf = bytearray()
 
         # ── Printer init ──
         buf += b'\x1b\x40'            # ESC @  – reset to defaults
         buf += b'\x1b\x4d\x00'        # ESC M 0 – Font A (widest)
-        buf += b'\x1b\x74\x02'        # ESC t 2 – code page 850 (better char coverage)
+        buf += b'\x1b\x74\x02'        # ESC t 2 – code page 850
 
-        # ── Set full print area (critical for avoiding narrow/centered output) ──
-        buf += b'\x1d\x4c\x00\x00'  # GS L  – left margin = 0 dots
-        # GS W nL nH – print area width in dots (203 DPI: 1mm ≈ 8 dots)
-        # 80mm paper: 72mm printable = 576 dots (0x0240)
-        # 58mm paper: 48mm printable = 384 dots (0x0180)
+        # ── Set full print area ──
+        buf += b'\x1d\x4c\x00\x00'    # GS L  – left margin = 0 dots
         if mm == 58:
-            buf += b'\x1d\x57\x80\x01'  # 384 dots
+            buf += b'\x1d\x57\x80\x01'  # GS W 384 dots
         else:
-            buf += b'\x1d\x57\x40\x02'  # 576 dots
-        buf += b'\x1b\x33\x1e'        # ESC 3 30 – line spacing = 30 dots (tight)
+            buf += b'\x1d\x57\x40\x02'  # GS W 576 dots
+        buf += b'\x1b\x33\x1e'          # ESC 3 30 – tight line spacing
 
         SEP = ("=" * W).encode("cp437")
         MID = ("-" * W).encode("cp437")
@@ -2212,9 +2322,11 @@ class BlazeBiteApp(ctk.CTk):
         def _enc(s: str) -> bytes:
             return s.encode("cp437", errors="replace")
 
-        # ── Text helpers with bold/size support ──
         def _set_bold(on: bool):
             buf.extend(b'\x1b\x45\x01' if on else b'\x1b\x45\x00')
+
+        def _set_underline(on: bool):
+            buf.extend(b'\x1b\x2d\x01' if on else b'\x1b\x2d\x00')
 
         def _set_double(w: bool = False, h: bool = False):
             mode = 0
@@ -2222,105 +2334,111 @@ class BlazeBiteApp(ctk.CTk):
                 mode |= 0x20
             if h:
                 mode |= 0x10
-            buf.extend(b'\x1d\x21' + bytes([mode]))  # GS ! – character size
-            # NOTE: Do NOT send ESC ! here — it conflicts with GS ! on Epson
-            # printers (last command wins) and would cancel double-size.
+            buf.extend(b'\x1d\x21' + bytes([mode]))  # GS !
 
         def center(text: str):
-            buf.extend(b'\x1b\x61\x01')    # ESC a 1 – center
+            buf.extend(b'\x1b\x61\x01')
             buf.extend(_enc(text))
             buf.extend(b'\n')
 
         def left(text: str):
-            buf.extend(b'\x1b\x61\x00')    # ESC a 0 – left
+            buf.extend(b'\x1b\x61\x00')
             buf.extend(_enc(text))
             buf.extend(b'\n')
 
         def left_sep():
-            buf.extend(b'\x1b\x61\x00')
-            buf.extend(SEP)
-            buf.extend(b'\n')
+            buf.extend(b'\x1b\x61\x00'); buf.extend(SEP); buf.extend(b'\n')
 
         def left_mid():
-            buf.extend(b'\x1b\x61\x00')
-            buf.extend(MID)
-            buf.extend(b'\n')
+            buf.extend(b'\x1b\x61\x00'); buf.extend(MID); buf.extend(b'\n')
 
         def lr(l: str, r: str):
-            """Left-right justified line – space-filled to W."""
             gap = max(1, W - len(l) - len(r))
             left(l + " " * gap + r)
 
-        # ── Header (centered, double-size store name) ──
+        # ── Header ──
         _set_bold(True)
         _set_double(w=True, h=True)
-        center(APP_NAME)
-
-        # FIX: explicitly reset BOTH dimensions + bold before separator/address
+        center(biz["name"])
         _set_double(w=False, h=False)
         _set_bold(False)
 
-        center("Restaurant")
-        center("46 Patrice Lumumba Rd, Airport")
-        center("P.O. Box 46, State House - Accra")
-        center("GA-117-2059")
-        left_sep()   # safe: font is fully reset before this line
+        center(biz["tagline"])
+        center(biz["address_line1"])
+        center(biz["address_line2"])
+        center(biz["digital_addr"])
+        if biz.get("phone"):
+            center(f"Tel: {biz['phone']}")
+        if biz.get("tin"):
+            center(f"TIN: {biz['tin']}")
+        left_sep()
 
-        # ── Order info (left-aligned) ──
-        now = datetime.datetime.now()
+        # ── Order info ──
         lr("Date:", now.strftime("%Y-%m-%d"))
         lr("Time:", now.strftime("%H:%M:%S"))
-        lr("Order:", f"#{self.order_counter:04d}")
+        lr("Order:", f"#{order_number:04d}")
+        lr("Cashier:", cashier)
+        lr("Store:", store)
         left_mid()
 
         # ── Column header & items ──
-        qty_w = 4
-        amt_w = 12
-        name_w = W - qty_w - amt_w - 2
+        qty_w  = 3
+        prc_w  = 8
+        amt_w  = 10
+        name_w = W - qty_w - prc_w - amt_w - 3
 
-        def item_line(n: str, q, a: str):
+        def item_line(n: str, q, p: str, a: str):
             n = (n or "")[:name_w]
-            left(f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}")
+            left(f"{n:<{name_w}} {str(q):>{qty_w}} {p:>{prc_w}} {a:>{amt_w}}")
 
         _set_bold(True)
-        item_line("ITEM", "QTY", "AMOUNT")
+        item_line("ITEM", "QTY", "PRICE", "AMOUNT")
         _set_bold(False)
         left_mid()
 
+        total_qty = 0
         for it in items:
             amt = it["price"] * it["qty"]
-            item_line(it["name"], it["qty"], f"GHS{amt:.2f}")
+            total_qty += it["qty"]
+            item_line(it["name"], it["qty"],
+                      f"{it['price']:,.2f}", f"{amt:,.2f}")
 
         left_mid()
 
-        # ── Totals ──
-        lr("Subtotal:", f"GHS{subtotal:.2f}")
-        tax_pct = TAX_RATE * 100
+        # ── Summary ──
+        lr(f"Items: {total_qty}", f"Subtotal: {fm(subtotal)}")
+        tax_pct = self.tax_rate * 100
         if tax_pct > 0:
-            lr(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}")
+            lr("", f"Tax ({tax_pct:.0f}%): {fm(tax)}")
         left_sep()
 
-        # FIX: bold only — no double-wide — avoids W // 2 math error
+        # ── TOTAL (bold + double-height for emphasis) ──
         _set_bold(True)
-        lr("TOTAL:", f"GHS{total:.2f}")
+        _set_double(h=True)
+        lr("TOTAL:", fm(total))
+        _set_double(h=False)
         _set_bold(False)
         left_sep()
 
         # ── Payment ──
         lr("Payment:", payment)
         if payment == "Cash" and cash_tendered is not None and change is not None:
-            lr("Cash Tendered:", f"GHS{cash_tendered:.2f}")
-            lr("Change:", f"GHS{change:.2f}")
+            lr("Tendered:", fm(cash_tendered))
+            lr("Change:", fm(change))
+        left_mid()
 
-        # ── Footer (centered) ──
+        # ── Footer ──
         left("")
-        center("Thank You For Your Patronage")
-        center("See You Soon!")
+        center(biz["footer_line1"])
+        center(biz["footer_line2"])
         left_sep()
 
         # ── Feed and cut ──
-        buf += b'\n\n\n'               # feed 3 lines past tear bar
-        buf += b'\x1d\x56\x42\x00'    # GS V 66 0 – partial cut (most compatible)
+        buf += b'\n\n\n'
+        buf += b'\x1d\x56\x42\x00'    # GS V 66 0 – partial cut
+
+        # ── Cash drawer kick (pulse pin 2, 100ms on / 100ms off) ──
+        buf += b'\x1b\x70\x00\x32\x32'   # ESC p 0 50 50
 
         return bytes(buf)
 
@@ -2332,7 +2450,7 @@ class BlazeBiteApp(ctk.CTk):
             return False, "Raw printing is only supported on Windows."
 
         try:
-            winspool = ctypes.windll.winspool
+            winspool = ctypes.WinDLL('winspool.drv', use_last_error=True)
 
             class DOCINFO1(ctypes.Structure):
                 _fields_ = [
@@ -2373,29 +2491,44 @@ class BlazeBiteApp(ctk.CTk):
 
     # ── PDF receipt (compact, receipt-width) ───
 
-    def _save_invoice_pdf(self, invoice_text: str, output_path: str):
-        """Render receipt text to a receipt-width PDF (for archival / fallback)."""
+    def _save_invoice_pdf(self, invoice_text: str, output_path: str,
+                          order_data: dict | None = None):
+        """Render receipt text to a receipt-width PDF with bold headers."""
         profile = self._get_receipt_profile(self._get_default_printer_name())
         W = profile["line_width"]
         mm = profile["mm"]
 
         PT_PER_MM = 2.8346
         page_w = mm * PT_PER_MM
-        margin = 4
+        margin = 6
         printable = page_w - 2 * margin
-        # Courier char width ≈ 0.6 × font_size; solve for font_size
         font_size = max(5.0, round(printable / (W * 0.6), 1))
         line_h = font_size + 2
 
         lines = invoice_text.splitlines()
-        page_h = margin + len(lines) * line_h + margin
+        page_h = margin + len(lines) * line_h + margin + 10  # +10 for breathing room
+
+        order_num = (order_data or {}).get("order_number", self.order_counter)
 
         pdf = canvas.Canvas(output_path, pagesize=(page_w, page_h))
-        pdf.setTitle(f"Invoice #{self.order_counter:04d}")
-        pdf.setFont("Courier", font_size)
+        pdf.setTitle(f"Receipt #{order_num:04d}")
+        pdf.setAuthor(BUSINESS_INFO["name"])
 
+        sep_chars = {"=", "-"}
         y = page_h - margin - font_size
         for line in lines:
+            stripped = line.strip()
+            is_sep = len(stripped) > 2 and all(c in sep_chars for c in stripped)
+
+            if is_sep:
+                pdf.setFont("Courier", font_size)
+            elif stripped.startswith("TOTAL:") or stripped.startswith("ITEM"):
+                pdf.setFont("Courier-Bold", font_size)
+            elif stripped == BUSINESS_INFO["name"]:
+                pdf.setFont("Courier-Bold", min(font_size + 2, 10))
+            else:
+                pdf.setFont("Courier", font_size)
+
             pdf.drawString(margin, y, line)
             y -= line_h
         pdf.save()
@@ -2419,25 +2552,32 @@ class BlazeBiteApp(ctk.CTk):
         if not HAS_ESCPOS:
             return False, "python-escpos library not installed."
 
-        items = order_data["items"]
-        subtotal = order_data["subtotal"]
-        tax = order_data["tax"]
-        total = order_data["total"]
-        payment = order_data["payment"]
-        cash_tendered = order_data.get("cash_tendered")
-        change = order_data.get("change")
+        items          = order_data["items"]
+        subtotal       = order_data["subtotal"]
+        tax            = order_data["tax"]
+        total          = order_data["total"]
+        payment        = order_data["payment"]
+        cash_tendered  = order_data.get("cash_tendered")
+        change         = order_data.get("change")
+        order_number   = order_data.get("order_number", self.order_counter)
+        cashier        = order_data.get("cashier", "—")
+        store          = order_data.get("store", "—")
+        now            = order_data.get("timestamp") or datetime.datetime.now()
 
-        W = self._get_receipt_profile(self._get_default_printer_name())["line_width"]
+        biz = BUSINESS_INFO
+        fm  = self._fmt_money
+        profile = self._get_receipt_profile(self._get_default_printer_name())
+        W   = profile["line_width"]
+        mm  = profile["mm"]
         SEP = "=" * W
         MID = "-" * W
-        now = datetime.datetime.now()
 
         # Try each known VID/PID with its profile
         p = None
         used_id = None
-        for vid, pid, profile in self._ESCPOS_USB_PROFILES:
+        for vid, pid, prof_name in self._ESCPOS_USB_PROFILES:
             try:
-                p = EscposUsb(vid, pid, in_ep=0x82, out_ep=0x01, profile=profile)
+                p = EscposUsb(vid, pid, in_ep=0x82, out_ep=0x01, profile=prof_name)
                 used_id = (vid, pid)
                 break
             except Exception:
@@ -2450,65 +2590,76 @@ class BlazeBiteApp(ctk.CTk):
         try:
             # ── Init ──
             p.charcode('AUTO')
-
-            # ── Set full print area (critical for avoiding narrow/centered output) ──
-            p._raw(b'\x1d\x4c\x00\x00')  # GS L  – left margin = 0 dots
-            # GS W – print area width: 576 dots for 80mm, 384 dots for 58mm
-            if self._get_receipt_profile(self._get_default_printer_name())["mm"] == 58:
-                p._raw(b'\x1d\x57\x80\x01')  # 384 dots
+            p._raw(b'\x1d\x4c\x00\x00')  # GS L  – left margin = 0
+            if mm == 58:
+                p._raw(b'\x1d\x57\x80\x01')  # GS W 384 dots
             else:
-                p._raw(b'\x1d\x57\x40\x02')  # 576 dots (full 80mm)
-            p._raw(b'\x1b\x33\x1e')            # ESC 3 30 – tight line spacing
+                p._raw(b'\x1d\x57\x40\x02')  # GS W 576 dots
+            p._raw(b'\x1b\x33\x1e')          # ESC 3 30 – tight line spacing
 
-            # ── Header (centered, double-size store name) ──
+            # ── Header ──
             p.set(align='center', bold=True, width=2, height=2)
-            p.textln(APP_NAME)
+            p.textln(biz["name"])
 
             p.set(align='center', bold=False, width=1, height=1)
-            p.textln("Restaurant")
-            p.textln("46 Patrice Lumumba Rd, Airport")
-            p.textln("P.O. Box 46, State House - Accra")
-            p.textln("GA-117-2059")
+            p.textln(biz["tagline"])
+            p.textln(biz["address_line1"])
+            p.textln(biz["address_line2"])
+            p.textln(biz["digital_addr"])
+            if biz.get("phone"):
+                p.textln(f"Tel: {biz['phone']}")
+            if biz.get("tin"):
+                p.textln(f"TIN: {biz['tin']}")
             p.textln(SEP)
 
-            # ── Order info (left-aligned) ──
+            # ── Order info ──
             p.set(align='left', bold=False, width=1, height=1)
             p.textln(self._left_right("Date:", now.strftime("%Y-%m-%d"), W))
             p.textln(self._left_right("Time:", now.strftime("%H:%M:%S"), W))
-            p.textln(self._left_right("Order:", f"#{self.order_counter:04d}", W))
+            p.textln(self._left_right("Order:", f"#{order_number:04d}", W))
+            p.textln(self._left_right("Cashier:", cashier, W))
+            p.textln(self._left_right("Store:", store, W))
             p.textln(MID)
 
             # ── Column header & items ──
-            qty_w = 4
-            amt_w = 12
-            name_w = W - qty_w - amt_w - 2
+            qty_w  = 3
+            prc_w  = 8
+            amt_w  = 10
+            name_w = W - qty_w - prc_w - amt_w - 3
 
-            def item_row(n, q, a):
+            def item_row(n, q, pr, a):
                 n = (n or "")[:name_w]
-                return f"{n:<{name_w}} {str(q):>{qty_w}} {a:>{amt_w}}"
+                return f"{n:<{name_w}} {str(q):>{qty_w}} {pr:>{prc_w}} {a:>{amt_w}}"
 
             p.set(align='left', bold=True, width=1, height=1)
-            p.textln(item_row("ITEM", "QTY", "AMOUNT"))
+            p.textln(item_row("ITEM", "QTY", "PRICE", "AMOUNT"))
             p.textln(MID)
 
             p.set(align='left', bold=False, width=1, height=1)
+            total_qty = 0
             for it in items:
                 amt = it["price"] * it["qty"]
-                p.textln(item_row(it["name"], it["qty"], f"GHS{amt:.2f}"))
+                total_qty += it["qty"]
+                p.textln(item_row(
+                    it["name"], it["qty"],
+                    f"{it['price']:,.2f}", f"{amt:,.2f}",
+                ))
 
             p.textln(MID)
 
-            # ── Totals ──
+            # ── Summary ──
             p.set(align='left', bold=False, width=1, height=1)
-            p.textln(self._left_right("Subtotal:", f"GHS{subtotal:.2f}", W))
-            tax_pct = TAX_RATE * 100
+            p.textln(self._left_right(
+                f"Items: {total_qty}", f"Subtotal: {fm(subtotal)}", W))
+            tax_pct = self.tax_rate * 100
             if tax_pct > 0:
-                p.textln(self._left_right(f"Tax ({tax_pct:.0f}%):", f"GHS{tax:.2f}", W))
+                p.textln(self._left_right(
+                    "", f"Tax ({tax_pct:.0f}%): {fm(tax)}", W))
             p.textln(SEP)
 
-            # FIX: bold only — NOT width=2 — so _left_right uses correct full W
-            p.set(align='left', bold=True, width=1, height=1)
-            p.textln(self._left_right("TOTAL:", f"GHS{total:.2f}", W))
+            # ── TOTAL (bold + double-height) ──
+            p.set(align='left', bold=True, width=1, height=2)
+            p.textln(self._left_right("TOTAL:", fm(total), W))
 
             p.set(align='left', bold=False, width=1, height=1)
             p.textln(SEP)
@@ -2516,19 +2667,21 @@ class BlazeBiteApp(ctk.CTk):
             # ── Payment ──
             p.textln(self._left_right("Payment:", payment, W))
             if payment == "Cash" and cash_tendered is not None and change is not None:
-                p.textln(self._left_right("Cash Tendered:", f"GHS{cash_tendered:.2f}", W))
-                p.textln(self._left_right("Change:", f"GHS{change:.2f}", W))
+                p.textln(self._left_right("Tendered:", fm(cash_tendered), W))
+                p.textln(self._left_right("Change:", fm(change), W))
+            p.textln(MID)
 
-            # ── Footer (centered) ──
+            # ── Footer ──
             p.set(align='center', bold=False, width=1, height=1)
             p.textln("")
-            p.textln("Thank You For Your Patronage")
-            p.textln("See You Soon!")
+            p.textln(biz["footer_line1"])
+            p.textln(biz["footer_line2"])
             p.textln(SEP)
 
-            # ── Feed and cut ──
+            # ── Feed, cut, cash drawer ──
             p.ln(3)
             p.cut()
+            p._raw(b'\x1b\x70\x00\x32\x32')   # ESC p – kick cash drawer
 
             p.close()
             vid_hex = f"0x{used_id[0]:04X}"
@@ -2552,24 +2705,37 @@ class BlazeBiteApp(ctk.CTk):
         else:
             mode_detail = f"Manual ({selected_mode})"
 
+        order_num = (order_data or {}).get("order_number", self.order_counter)
+        total_qty = sum(it["qty"] for it in (order_data or {}).get("items", []))
+        total_amt = (order_data or {}).get("total", 0)
+
         win = ctk.CTkToplevel(self)
-        win.title("Order Receipt")
-        win.geometry("500x700")
+        win.title(f"Receipt #{order_num:04d}")
+        win.geometry("540x750")
         win.configure(fg_color=COLORS["bg_dark"])
         win.grab_set()
 
+        # ── Top banner ──
         ctk.CTkLabel(win, text="✅  Order Complete!",
                      font=ctk.CTkFont("Helvetica", 18, "bold"),
-                     text_color=COLORS["success"]).pack(pady=(18, 8))
+                     text_color=COLORS["success"]).pack(pady=(14, 4))
+
+        summary_text = (
+            f"Order #{order_num:04d}  |  {total_qty} item{'s' if total_qty != 1 else ''}  |  "
+            f"Total: {self._fmt_money(total_amt)}"
+        )
+        ctk.CTkLabel(win, text=summary_text,
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["accent"]).pack(pady=(0, 2))
 
         ctk.CTkLabel(
             win,
-            text=f"Print Profile: {active_profile['paper']}  |  {mode_detail}",
+            text=f"Profile: {active_profile['paper']}  |  {mode_detail}",
             font=ctk.CTkFont("Helvetica", 10),
             text_color=COLORS["text_muted"],
-        ).pack(pady=(0, 4))
+        ).pack(pady=(0, 6))
 
-        # Printer selector
+        # ── Printer selector row ──
         printer_row = ctk.CTkFrame(win, fg_color="transparent")
         printer_row.pack(fill="x", padx=16, pady=(0, 8))
 
@@ -2608,121 +2774,148 @@ class BlazeBiteApp(ctk.CTk):
             elif vals:
                 printer_var.set(vals[0])
 
-        txt = ctk.CTkTextbox(win, fg_color=COLORS["bg_dark"],
+        # ── Receipt preview ──
+        txt = ctk.CTkTextbox(win, fg_color=COLORS["bg_panel"],
                              text_color=COLORS["text_primary"],
-                             font=ctk.CTkFont("Courier", 12),
-                             corner_radius=8)
+                             font=ctk.CTkFont("Courier", 11),
+                             corner_radius=8, border_width=1,
+                             border_color=COLORS["border"])
         txt.pack(fill="both", expand=True, padx=16, pady=4)
         txt.insert("end", invoice)
         txt.configure(state="disabled")
 
-        def print_invoice():
+        # ── Status label (below preview) ──
+        status_var = tk.StringVar(value="")
+        status_lbl = ctk.CTkLabel(win, textvariable=status_var,
+                                  font=ctk.CTkFont("Helvetica", 10),
+                                  text_color=COLORS["text_muted"])
+        status_lbl.pack(pady=(2, 0))
+
+        def _do_print():
+            """Save receipt as PDF, then print via ESC/POS or PDF fallback."""
             app_data_dir = get_app_data_dir()
             chosen_printer = printer_var.get().strip()
-            printable_invoice = invoice
 
-            # Save PDF archive copy
-            pdf_fname = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.pdf")
-            self._save_invoice_pdf(printable_invoice, pdf_fname)
+            # ── Step 1: Save PDF to disk (archive copy) ──
+            pdf_path = os.path.join(app_data_dir, f"receipt_{order_num:04d}.pdf")
+            self._save_invoice_pdf(invoice, pdf_path, order_data)
+            status_var.set(f"Saved: {pdf_path}")
+            win.update_idletasks()
 
             if not chosen_printer or chosen_printer == "(No printers found)":
                 messagebox.showerror(
                     "Printer Not Detected",
-                    "No printer was selected or detected on this system.\n"
-                    "Connect a printer, set it as default in Windows Settings,\n"
-                    "then click ⟳ to refresh the printer list.\n\n"
-                    f"Invoice PDF was still saved as:\n{pdf_fname}"
+                    "No printer was selected or detected.\n"
+                    "Connect a printer, set it as default,\n"
+                    "then click ⟳ to refresh.\n\n"
+                    f"Receipt PDF saved as:\n{pdf_path}"
                 )
                 return
+
+            status_var.set("Sending to printer...")
+            win.update_idletasks()
 
             ok = False
             detail = ""
 
-            # Method 1: python-escpos direct USB (best for thermal printers)
+            # ── Step 2: Try ESC/POS first (thermal receipt printers) ──
+
+            # Method 1: python-escpos direct USB
             if order_data and HAS_ESCPOS:
                 try:
                     escpos_ok, escpos_detail = self._print_via_escpos(order_data)
                     if escpos_ok:
-                        ok = True
-                        detail = escpos_detail
+                        ok, detail = True, escpos_detail
+                    else:
+                        detail += f"python-escpos: {escpos_detail}\n"
                 except Exception as e0:
-                    detail = f"python-escpos: {e0}\n"
+                    detail += f"python-escpos: {e0}\n"
 
             # Method 2: RAW ESC/POS via Windows spooler
             if not ok and order_data:
                 try:
-                    escpos_data = self._build_escpos_receipt(
-                        order_data["items"], order_data["subtotal"],
-                        order_data["tax"], order_data["total"],
-                        order_data["payment"], order_data.get("cash_tendered"),
-                        order_data.get("change"),
-                    )
+                    escpos_data = self._build_escpos_receipt(order_data)
                     raw_ok, raw_detail = self._send_raw_to_printer(chosen_printer, escpos_data)
                     if raw_ok:
-                        ok = True
-                        detail = raw_detail
+                        ok, detail = True, raw_detail
+                    else:
+                        detail += f"RAW spooler: {raw_detail}\n"
                 except Exception as e2:
                     detail += f"RAW spooler: {e2}\n"
 
-            # Method 3: PowerShell Out-Printer (for non-thermal / office printers)
-            if not ok:
-                txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write(printable_invoice)
-                safe_printer = chosen_printer.replace("'", "''")
-                safe_path = txt_path.replace("'", "''")
-                try:
-                    subprocess.run(
-                        ["powershell", "-NoProfile", "-Command",
-                         f"Get-Content -Path '{safe_path}' | Out-Printer -Name '{safe_printer}'"],
-                        check=True, timeout=15, capture_output=True,
-                    )
-                    ok = True
-                    detail = "Sent to printer via Out-Printer."
-                except Exception as e3:
-                    detail += f"Out-Printer: {e3}\n"
+            # ── Step 3: PDF fallback (office / non-thermal printers) ──
 
-            # Method 4: notepad /p (last resort)
+            # Method 3: Print PDF via Windows shell "printto"
             if not ok:
                 try:
-                    txt_path = os.path.join(app_data_dir, f"invoice_{self.order_counter:04d}.txt")
-                    if not os.path.exists(txt_path):
-                        with open(txt_path, "w", encoding="utf-8") as f:
-                            f.write(printable_invoice)
-                    subprocess.run(["notepad.exe", "/p", txt_path],
-                                   check=True, timeout=30)
-                    ok = True
-                    detail = "Sent to printer via Notepad."
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        None, "printto", pdf_path, f'"{chosen_printer}"', ".", 0
+                    )
+                    if ret > 32:
+                        ok, detail = True, "PDF sent via ShellExecute printto."
+                    else:
+                        detail += f"ShellExecute printto returned {ret}\n"
+                except Exception as e3:
+                    detail += f"ShellExecute: {e3}\n"
+
+            # Method 4: Print PDF via os.startfile (default printer)
+            if not ok:
+                try:
+                    os.startfile(pdf_path, "print")
+                    ok, detail = True, "PDF sent via default PDF handler."
                 except Exception as e4:
-                    detail += f"Notepad: {e4}"
+                    detail += f"os.startfile: {e4}\n"
 
             if ok:
+                status_var.set(f"✅ {detail}")
                 messagebox.showinfo(
                     "Print Sent",
                     f"Receipt sent to '{chosen_printer}'.\n{detail}\n\n"
-                    f"Invoice PDF saved as:\n{pdf_fname}"
+                    f"PDF saved: {pdf_path}"
                 )
             else:
+                status_var.set("❌ Print failed — see error dialog")
                 messagebox.showerror(
                     "Print Failed",
                     f"Could not print to '{chosen_printer}'.\n\n{detail}\n\n"
-                    f"Invoice PDF was still saved as:\n{pdf_fname}"
+                    f"PDF saved: {pdf_path}"
                 )
 
-        btn_row = ctk.CTkFrame(win, fg_color="transparent")
-        btn_row.pack(pady=16)
+        def _save_text_copy():
+            """Save receipt as .txt in the app data folder and notify."""
+            app_data_dir = get_app_data_dir()
+            txt_path = os.path.join(app_data_dir, f"receipt_{order_num:04d}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(invoice)
+            status_var.set(f"Saved: {txt_path}")
 
-        ctk.CTkButton(btn_row, text="🖨️  Print Receipt", width=140, height=42,
+        # ── Button row ──
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=(8, 16))
+
+        ctk.CTkButton(btn_row, text="🖨️  Print", width=120, height=42,
                       fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
                       text_color="#0A0E27", corner_radius=9,
                       font=ctk.CTkFont("Helvetica", 13, "bold"),
-                      command=print_invoice).pack(side="left", padx=8)
+                      command=_do_print).pack(side="left", padx=6)
 
-        ctk.CTkButton(btn_row, text="✖  Close", width=140, height=42,
+        ctk.CTkButton(btn_row, text="🖨️  Reprint", width=100, height=42,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"], corner_radius=9,
+                      font=ctk.CTkFont("Helvetica", 12),
+                      command=_do_print).pack(side="left", padx=6)
+
+        ctk.CTkButton(btn_row, text="💾 Save", width=80, height=42,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"], corner_radius=9,
+                      font=ctk.CTkFont("Helvetica", 12),
+                      command=_save_text_copy).pack(side="left", padx=6)
+
+        ctk.CTkButton(btn_row, text="✖ Close", width=80, height=42,
                       fg_color=COLORS["border"], hover_color=COLORS["bg_card"],
                       text_color=COLORS["text_primary"], corner_radius=9,
-                      font=ctk.CTkFont("Helvetica", 13, "bold"),
-                      command=win.destroy).pack(side="left", padx=8)
+                      font=ctk.CTkFont("Helvetica", 12),
+                      command=win.destroy).pack(side="left", padx=6)
 
     # ═══════════════════════════════════════════
     #  ADMIN VIEW
@@ -2932,6 +3125,46 @@ class BlazeBiteApp(ctk.CTk):
             text_color="white", font=ctk.CTkFont("Helvetica", 10, "bold"),
             command=self._admin_delete_category,
         ).pack(side="left")
+
+        # ─── Tax Rate Setting ───
+        tax_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
+                                 corner_radius=10, border_width=1,
+                                 border_color=COLORS["border"])
+        tax_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(tax_frame, text="💰  Tax Rate",
+                     font=ctk.CTkFont("Helvetica", 14, "bold"),
+                     text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 4))
+
+        tax_row = ctk.CTkFrame(tax_frame, fg_color="transparent")
+        tax_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkLabel(tax_row, text="Rate (%):",
+                     font=ctk.CTkFont("Helvetica", 11, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 8))
+
+        self._admin_tax_var = tk.StringVar(value=f"{self.tax_rate * 100:.1f}")
+        self._admin_tax_entry = ctk.CTkEntry(
+            tax_row, textvariable=self._admin_tax_var,
+            width=80, height=32, corner_radius=8,
+            fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont("Helvetica", 12),
+        )
+        self._admin_tax_entry.pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            tax_row, text="Apply", width=80, height=32, corner_radius=8,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+            text_color="white", font=ctk.CTkFont("Helvetica", 11, "bold"),
+            command=self._on_tax_rate_changed,
+        ).pack(side="left", padx=(0, 8))
+
+        self._admin_tax_status = ctk.CTkLabel(
+            tax_row, text=f"Current: {self.tax_rate * 100:.1f}%",
+            font=ctk.CTkFont("Helvetica", 10),
+            text_color=COLORS["text_muted"])
+        self._admin_tax_status.pack(side="left", padx=(8, 0))
 
         # Receipt printer settings
         receipt_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
