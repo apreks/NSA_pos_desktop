@@ -228,6 +228,7 @@ class Database:
         self._ensure_column("products", "archived", "INTEGER", default=0)
         self._ensure_column("products", "barcode", "TEXT", default="")
         self._ensure_column("users", "disabled", "INTEGER", default=0)
+        self._ensure_column("users", "must_change_password", "INTEGER", default=0)
 
     def _has_column(self, table: str, column: str) -> bool:
         cur = self.conn.execute(f"PRAGMA table_info({table})")
@@ -463,10 +464,10 @@ class Database:
         self.conn.execute("DELETE FROM users WHERE id=?", (id,))
         self.conn.commit()
 
-    def add_user(self, store: str, role: str, username: str, password: str):
+    def add_user(self, store: str, role: str, username: str, password: str, must_change_password: int = 0):
         self.conn.execute(
-            "INSERT INTO users (store, role, username, password, disabled) VALUES (?, ?, ?, ?, 0)",
-            (store, role, username, password),
+            "INSERT INTO users (store, role, username, password, disabled, must_change_password) VALUES (?, ?, ?, ?, 0, ?)",
+            (store, role, username, password, must_change_password),
         )
         self.conn.commit()
 
@@ -475,6 +476,56 @@ class Database:
             "UPDATE users SET disabled=? WHERE id=?",
             (1 if disabled else 0, user_id),
         )
+        self.conn.commit()
+
+    def update_username(self, user_id: int, new_username: str):
+        self.conn.execute(
+            "UPDATE users SET username=? WHERE id=?",
+            (new_username, user_id),
+        )
+        self.conn.commit()
+
+    def update_password(self, user_id: int, new_password: str):
+        self.conn.execute(
+            "UPDATE users SET password=? WHERE id=?",
+            (new_password, user_id),
+        )
+        self.conn.commit()
+
+    def set_must_change_password(self, user_id: int, must_change: bool):
+        self.conn.execute(
+            "UPDATE users SET must_change_password=? WHERE id=?",
+            (1 if must_change else 0, user_id),
+        )
+        self.conn.commit()
+
+    def get_user_by_id(self, user_id: int):
+        cur = self.conn.execute(
+            "SELECT id, store, role, username, password, COALESCE(disabled,0), COALESCE(must_change_password,0) FROM users WHERE id=?",
+            (user_id,),
+        )
+        return cur.fetchone()
+
+    def get_user_id_by_credentials(self, store: str, role: str, username: str):
+        if role == "root_admin":
+            cur = self.conn.execute(
+                "SELECT id FROM users WHERE role=? AND username=? LIMIT 1",
+                ("root_admin", username),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT id FROM users WHERE store=? AND role=? AND username=? LIMIT 1",
+                (store, role, username),
+            )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def reset_order_numbers(self, store: str | None = None):
+        """Delete all transactions for a store (or all stores) to reset order numbering."""
+        if store and store != "system":
+            self.conn.execute("DELETE FROM transactions WHERE store=?", (store,))
+        else:
+            self.conn.execute("DELETE FROM transactions")
         self.conn.commit()
 
     def log_activity(self, actor_username: str, actor_role: str, action: str,
@@ -3365,6 +3416,16 @@ class BlazeBiteApp(ctk.CTk):
 
         ctk.CTkButton(
             header,
+            text="🔄 Reset Order #",
+            width=140,
+            fg_color=COLORS["error"],
+            hover_color="#DC2626",
+            text_color="white",
+            command=self._open_reset_order_dialog,
+        ).pack(side="right", padx=(8, 4), pady=10)
+
+        ctk.CTkButton(
+            header,
             text="Refresh",
             width=100,
             fg_color=COLORS["accent"],
@@ -3433,6 +3494,24 @@ class BlazeBiteApp(ctk.CTk):
             hover_color="#059669",
             text_color="white",
             command=lambda: self._toggle_user_status(False),
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            user_actions,
+            text="Edit Username",
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_glow"],
+            text_color="#0A0E27",
+            command=self._open_edit_username_dialog,
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            user_actions,
+            text="Reset Password",
+            fg_color=COLORS["border"],
+            hover_color=COLORS["bg_hover"],
+            text_color=COLORS["text_primary"],
+            command=self._open_reset_password_dialog,
         ).pack(side="left", padx=4)
 
         # All-system item list (read-only)
@@ -3978,7 +4057,7 @@ class BlazeBiteApp(ctk.CTk):
                 store = "system"
 
             try:
-                self.db.add_user(store, role, username, password)
+                self.db.add_user(store, role, username, password, must_change_password=1)
                 self.db.log_activity(
                     self.current_user or "root_admin",
                     "root_admin",
@@ -4032,6 +4111,197 @@ class BlazeBiteApp(ctk.CTk):
             store="system",
         )
         self._refresh_root_admin()
+
+    # ── Root Admin: Edit Username ─────────────────────────────
+
+    def _open_edit_username_dialog(self):
+        if self.current_role != "root_admin":
+            messagebox.showerror("Access Denied", "Only root admin can edit usernames.")
+            return
+
+        selected = self.root_user_tree.selection() if hasattr(self, "root_user_tree") else []
+        if not selected:
+            messagebox.showwarning("No Selection", "Select a user first.")
+            return
+
+        values = self.root_user_tree.item(selected[0], "values")
+        if not values:
+            return
+
+        user_id = int(values[0])
+        old_username = values[3]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Edit Username")
+        dialog.geometry("400x220")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        ctk.CTkLabel(dialog, text=f"Current username: {old_username}",
+                     font=ctk.CTkFont("Helvetica", 12),
+                     text_color=COLORS["text_secondary"]).pack(pady=(20, 8))
+
+        ctk.CTkLabel(dialog, text="New Username:").pack(pady=(4, 4))
+        new_entry = ctk.CTkEntry(dialog, width=300)
+        new_entry.pack(padx=20)
+        new_entry.insert(0, old_username)
+        new_entry.select_range(0, "end")
+        new_entry.focus()
+
+        def save():
+            new_name = new_entry.get().strip()
+            if not new_name:
+                messagebox.showerror("Error", "Username cannot be empty.")
+                return
+            if new_name == old_username:
+                dialog.destroy()
+                return
+            self.db.update_username(user_id, new_name)
+            self.db.log_activity(
+                self.current_user or "root_admin", "root_admin",
+                "EDIT_USERNAME", old_username,
+                f"renamed to '{new_name}'", store="system",
+            )
+            if self.current_user == old_username:
+                self.current_user = new_name
+            self._refresh_root_admin()
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Username changed: {old_username} → {new_name}")
+
+        btns = ctk.CTkFrame(dialog, fg_color="transparent")
+        btns.pack(pady=18)
+        ctk.CTkButton(btns, text="Save", width=110, command=save).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel", width=110, command=dialog.destroy).pack(side="left", padx=6)
+
+    # ── Root Admin: Reset Password (forces change on next login) ──
+
+    def _open_reset_password_dialog(self):
+        if self.current_role != "root_admin":
+            messagebox.showerror("Access Denied", "Only root admin can reset passwords.")
+            return
+
+        selected = self.root_user_tree.selection() if hasattr(self, "root_user_tree") else []
+        if not selected:
+            messagebox.showwarning("No Selection", "Select a user first.")
+            return
+
+        values = self.root_user_tree.item(selected[0], "values")
+        if not values:
+            return
+
+        user_id = int(values[0])
+        username = values[3]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Reset Password")
+        dialog.geometry("400x260")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        ctk.CTkLabel(dialog, text=f"Reset password for: {username}",
+                     font=ctk.CTkFont("Helvetica", 12, "bold"),
+                     text_color=COLORS["text_secondary"]).pack(pady=(20, 8))
+
+        ctk.CTkLabel(dialog, text="New Password:").pack(pady=(4, 4))
+        pwd_entry = ctk.CTkEntry(dialog, width=300, show="*")
+        pwd_entry.pack(padx=20)
+        pwd_entry.focus()
+
+        ctk.CTkLabel(dialog, text="Confirm Password:").pack(pady=(8, 4))
+        confirm_entry = ctk.CTkEntry(dialog, width=300, show="*")
+        confirm_entry.pack(padx=20)
+
+        def save():
+            new_pwd = pwd_entry.get().strip()
+            confirm = confirm_entry.get().strip()
+            if not new_pwd:
+                messagebox.showerror("Error", "Password cannot be empty.")
+                return
+            if new_pwd != confirm:
+                messagebox.showerror("Error", "Passwords do not match.")
+                return
+            self.db.update_password(user_id, new_pwd)
+            self.db.set_must_change_password(user_id, True)
+            self.db.log_activity(
+                self.current_user or "root_admin", "root_admin",
+                "RESET_PASSWORD", username,
+                "password reset, must change on next login", store="system",
+            )
+            dialog.destroy()
+            messagebox.showinfo("Success", f"Password reset for '{username}'.\nThey must set a new password on next login.")
+
+        btns = ctk.CTkFrame(dialog, fg_color="transparent")
+        btns.pack(pady=18)
+        ctk.CTkButton(btns, text="Reset", width=110, command=save).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel", width=110, command=dialog.destroy).pack(side="left", padx=6)
+
+    # ── Root Admin: Reset Order Counter ───────────────────────
+
+    def _open_reset_order_dialog(self):
+        if self.current_role != "root_admin":
+            messagebox.showerror("Access Denied", "Only root admin can reset order numbers.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Reset Order Counter")
+        dialog.geometry("440x300")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+
+        ctk.CTkLabel(dialog, text="⚠️  Reset Order Counter",
+                     font=ctk.CTkFont("Helvetica", 16, "bold"),
+                     text_color=COLORS["warning"]).pack(pady=(20, 8))
+
+        ctk.CTkLabel(dialog,
+                     text="This will delete all transaction history\n"
+                          "for the selected store and reset the\n"
+                          "order number back to #1001.",
+                     font=ctk.CTkFont("Helvetica", 11),
+                     text_color=COLORS["text_secondary"],
+                     justify="center").pack(pady=(0, 12))
+
+        ctk.CTkLabel(dialog, text="Store:").pack(pady=(4, 4))
+        store_var = tk.StringVar(value="All Stores")
+        ctk.CTkComboBox(dialog, values=["All Stores", "Fast Food", "Cold Store"],
+                        variable=store_var, width=250).pack(padx=20)
+
+        def confirm_reset():
+            choice = store_var.get()
+            store_map = {"Fast Food": "fast_food", "Cold Store": "cold_store"}
+            store_key = store_map.get(choice, None)  # None means all
+
+            label = choice
+            if not messagebox.askyesno(
+                "Confirm Reset",
+                f"Are you sure you want to delete ALL transactions for '{label}'\n"
+                "and reset the order counter?\n\n"
+                "This action cannot be undone!",
+                icon="warning",
+            ):
+                return
+
+            self.db.reset_order_numbers(store=store_key)
+            self.order_counter = 1001
+            self.order_badge.configure(text=f"Order  # {self.order_counter:04d}")
+            self.db.log_activity(
+                self.current_user or "root_admin", "root_admin",
+                "RESET_ORDER_COUNTER", label,
+                f"All transactions deleted, order counter reset to 1001",
+                store="system",
+            )
+            self._refresh_root_admin()
+            dialog.destroy()
+            messagebox.showinfo("Done", f"Order counter reset for '{label}'.\nNext order will be #1001.")
+
+        btns = ctk.CTkFrame(dialog, fg_color="transparent")
+        btns.pack(pady=18)
+        ctk.CTkButton(btns, text="Reset", width=110,
+                      fg_color=COLORS["error"], hover_color="#DC2626",
+                      text_color="white", command=confirm_reset).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel", width=110, command=dialog.destroy).pack(side="left", padx=6)
 
     def _apply_tx_filter(self):
         """Apply the From/To date filter to the transaction table."""
@@ -5453,6 +5723,10 @@ class BlazeBiteApp(ctk.CTk):
                 cur_entry.delete(0, "end")
                 return
             self.db.add_or_update_user(store, role, self.current_user, new_pw)
+            # Clear must_change_password flag if set
+            uid = self.db.get_user_id_by_credentials(store, role, self.current_user)
+            if uid:
+                self.db.set_must_change_password(uid, False)
             self.db.log_activity(self.current_user, role, "CHANGE_PASSWORD",
                                  self.current_user, "Password changed", store=store)
             dialog.destroy()
@@ -5612,6 +5886,91 @@ class BlazeBiteApp(ctk.CTk):
         ctk.CTkButton(btn_frame, text="Save", command=save).pack(side="left", padx=5)
         ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
 
+    def _show_forced_password_change(self, user_id: int):
+        """Show a mandatory password change dialog (blocks until user sets a new password)."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Password Update Required")
+        dialog.geometry("400x380")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.focus_force()
+        dialog.configure(fg_color=COLORS["bg_dark"])
+        dialog.update_idletasks()
+        sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+        dialog.geometry(f"400x380+{(sw - 400) // 2}+{(sh - 380) // 2}")
+
+        # Prevent closing without changing password
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        ctk.CTkFrame(dialog, fg_color="transparent", height=16).pack()
+        ctk.CTkLabel(dialog, text="🔐  Password Update Required",
+                     font=ctk.CTkFont("Helvetica", 16, "bold"),
+                     text_color=COLORS["warning"]).pack(pady=(0, 4))
+        ctk.CTkLabel(dialog,
+                     text="You must set a new password before continuing.",
+                     font=ctk.CTkFont("Helvetica", 11),
+                     text_color=COLORS["text_muted"]).pack(pady=(0, 16))
+
+        def _lbl(text):
+            ctk.CTkLabel(dialog, text=text,
+                         font=ctk.CTkFont("Helvetica", 10, "bold"),
+                         text_color=COLORS["text_muted"]).pack(anchor="w", padx=32, pady=(4, 2))
+
+        _lbl("NEW PASSWORD")
+        new_entry = ctk.CTkEntry(dialog, placeholder_text="Enter new password",
+                                  show="*", height=42, corner_radius=8,
+                                  border_color=COLORS["border"],
+                                  fg_color=COLORS["bg_card"],
+                                  text_color=COLORS["text_primary"])
+        new_entry.pack(fill="x", padx=32, pady=(0, 8))
+        new_entry.focus()
+
+        _lbl("CONFIRM NEW PASSWORD")
+        conf_entry = ctk.CTkEntry(dialog, placeholder_text="Confirm new password",
+                                   show="*", height=42, corner_radius=8,
+                                   border_color=COLORS["border"],
+                                   fg_color=COLORS["bg_card"],
+                                   text_color=COLORS["text_primary"])
+        conf_entry.pack(fill="x", padx=32, pady=(0, 8))
+
+        status_lbl = ctk.CTkLabel(dialog, text="",
+                                   font=ctk.CTkFont("Helvetica", 11),
+                                   text_color=COLORS["error"])
+        status_lbl.pack(anchor="w", padx=32, pady=(0, 8))
+
+        def _save():
+            new_pw  = new_entry.get().strip()
+            conf_pw = conf_entry.get().strip()
+            if not new_pw or not conf_pw:
+                status_lbl.configure(text="⚠  Both fields are required.")
+                return
+            if new_pw != conf_pw:
+                status_lbl.configure(text="✖  Passwords do not match.")
+                return
+            if len(new_pw) < 4:
+                status_lbl.configure(text="⚠  Minimum 4 characters required.")
+                return
+            self.db.update_password(user_id, new_pw)
+            self.db.set_must_change_password(user_id, False)
+            self.db.log_activity(self.current_user, self.current_role,
+                                 "FIRST_LOGIN_PASSWORD_CHANGE",
+                                 self.current_user, "Password set after first login",
+                                 store=self.active_store or "system")
+            dialog.destroy()
+            messagebox.showinfo("Success", "Password updated successfully.\nYou may now continue.")
+
+        ctk.CTkButton(
+            dialog, text="Update Password",
+            height=44, corner_radius=10,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+            text_color="#0A0E27",
+            font=ctk.CTkFont("Helvetica", 13, "bold"),
+            command=_save,
+        ).pack(fill="x", padx=32, pady=(4, 0))
+
+        self.wait_window(dialog)
+
     def _show_login(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"{APP_NAME}  —  Sign In")
@@ -5706,6 +6065,11 @@ class BlazeBiteApp(ctk.CTk):
             else:
                 self._show_view("pos")
             dialog.destroy()
+
+            # Check if user must change password on first login
+            u_row = self.db.get_user_by_id(_user_id)
+            if u_row and u_row[6]:  # must_change_password flag
+                self._show_forced_password_change(_user_id)
 
         # ════════════════ ROOT GRID: 2 columns ════════════════
         dialog.columnconfigure(0, weight=5)
