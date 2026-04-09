@@ -2175,19 +2175,49 @@ class BlazeBiteApp(ctk.CTk):
         if os.name != "nt":
             return printers
 
+        # ── Fast path: native Win32 EnumPrintersW (instant) ──
         try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "(Get-CimInstance -ClassName Win32_Printer).Name"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            )
-            for line in result.stdout.strip().splitlines():
-                name = line.strip()
-                if name:
-                    printers.append(name)
+            winspool = ctypes.windll.winspool
+            PRINTER_ENUM_LOCAL = 0x00000002
+            PRINTER_ENUM_CONNECTIONS = 0x00000004
+            flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS
+
+            class PRINTER_INFO_1(ctypes.Structure):
+                _fields_ = [
+                    ("Flags", wintypes.DWORD),
+                    ("pDescription", wintypes.LPWSTR),
+                    ("pName", wintypes.LPWSTR),
+                    ("pComment", wintypes.LPWSTR),
+                ]
+
+            needed = wintypes.DWORD(0)
+            count = wintypes.DWORD(0)
+            winspool.EnumPrintersW(flags, None, 1, None, 0,
+                                   ctypes.byref(needed), ctypes.byref(count))
+            if needed.value > 0:
+                buf = (ctypes.c_byte * needed.value)()
+                if winspool.EnumPrintersW(flags, None, 1, buf, needed.value,
+                                          ctypes.byref(needed), ctypes.byref(count)):
+                    arr = (PRINTER_INFO_1 * count.value).from_buffer(buf)
+                    printers = [p.pName for p in arr if p.pName]
         except Exception:
             pass
+
+        # ── Slow fallback: PowerShell (only if native failed) ──
+        if not printers:
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance -ClassName Win32_Printer).Name"],
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                )
+                for line in result.stdout.strip().splitlines():
+                    name = line.strip()
+                    if name:
+                        printers.append(name)
+            except Exception:
+                pass
 
         cache["list"] = printers
         cache["ts_list"] = _time.monotonic()
@@ -2887,18 +2917,7 @@ class BlazeBiteApp(ctk.CTk):
 
                 # ── Fast path: ESC/POS (thermal receipt printers) ──
 
-                # Method 1: python-escpos direct USB
-                if order_data and HAS_ESCPOS:
-                    try:
-                        escpos_ok, escpos_detail = self._print_via_escpos(order_data)
-                        if escpos_ok:
-                            ok, detail = True, escpos_detail
-                        else:
-                            detail += f"python-escpos: {escpos_detail}\n"
-                    except Exception as e0:
-                        detail += f"python-escpos: {e0}\n"
-
-                # Method 2: RAW ESC/POS via Windows spooler
+                # Method 1: RAW ESC/POS via Windows spooler (fastest)
                 if not ok and order_data:
                     try:
                         escpos_data = self._build_escpos_receipt(order_data)
@@ -2909,6 +2928,17 @@ class BlazeBiteApp(ctk.CTk):
                             detail += f"RAW spooler: {raw_detail}\n"
                     except Exception as e2:
                         detail += f"RAW spooler: {e2}\n"
+
+                # Method 2: python-escpos direct USB (fallback)
+                if not ok and order_data and HAS_ESCPOS:
+                    try:
+                        escpos_ok, escpos_detail = self._print_via_escpos(order_data)
+                        if escpos_ok:
+                            ok, detail = True, escpos_detail
+                        else:
+                            detail += f"python-escpos: {escpos_detail}\n"
+                    except Exception as e0:
+                        detail += f"python-escpos: {e0}\n"
 
                 # ── Slow path: generate PDF only if ESC/POS failed ──
                 pdf_path = None
@@ -2937,24 +2967,11 @@ class BlazeBiteApp(ctk.CTk):
                         except Exception as e4:
                             detail += f"os.startfile: {e4}\n"
 
-                # ── Save PDF archive in background (non-blocking) ──
-                if ok and pdf_path is None:
-                    try:
-                        app_data_dir = get_app_data_dir()
-                        pdf_path = os.path.join(app_data_dir, f"receipt_{order_num:04d}.pdf")
-                        self._save_invoice_pdf(invoice, pdf_path, order_data)
-                    except Exception:
-                        pass
-
-                # ── Report result back on the UI thread ──
+                # ── Report result back on the UI thread immediately ──
                 final_pdf = pdf_path
                 def _on_done():
                     if ok:
                         status_var.set(f"✅ {detail}")
-                        messagebox.showinfo(
-                            "Print Sent",
-                            f"Receipt sent to '{chosen_printer}'.\n{detail}"
-                        )
                     else:
                         status_var.set("❌ Print failed — see error dialog")
                         msg = f"Could not print to '{chosen_printer}'.\n\n{detail}"
@@ -2963,6 +2980,17 @@ class BlazeBiteApp(ctk.CTk):
                         messagebox.showerror("Print Failed", msg)
 
                 win.after(0, _on_done)
+
+                # ── Save PDF archive in background (don't block UI) ──
+                if ok and pdf_path is None:
+                    def _archive_pdf():
+                        try:
+                            d = get_app_data_dir()
+                            p = os.path.join(d, f"receipt_{order_num:04d}.pdf")
+                            self._save_invoice_pdf(invoice, p, order_data)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_archive_pdf, daemon=True).start()
 
             threading.Thread(target=_print_worker, daemon=True).start()
 
