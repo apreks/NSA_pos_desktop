@@ -23,7 +23,7 @@ from PIL import Image as PILImage, ImageTk
 try:
     from escpos.printer import Usb as EscposUsb
     HAS_ESCPOS = True
-except ImportError:
+except Exception:
     HAS_ESCPOS = False
 
 # ─────────────────────────────────────────────
