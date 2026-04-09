@@ -2118,41 +2118,59 @@ class BlazeBiteApp(ctk.CTk):
         self.order_counter += 1
         self.order_badge.configure(text=f"Order  # {self.order_counter:04d}")
 
+    _printer_cache: dict = {}   # {"name": ..., "list": ..., "ts": float}
+
     def _get_default_printer_name(self) -> str | None:
         """Return the default Windows printer name, or None if unavailable."""
+        # Return cached value if fresh (< 10 s)
+        import time as _time
+        cache = self._printer_cache
+        if "name" in cache and (_time.monotonic() - cache.get("ts_name", 0)) < 10:
+            return cache["name"]
+
         if os.name != "nt":
             return None
+
+        result_name = None
 
         try:
             needed = wintypes.DWORD(0)
             ctypes.windll.winspool.GetDefaultPrinterW(None, ctypes.byref(needed))
-            if needed.value <= 0:
-                return None
-
-            buffer = ctypes.create_unicode_buffer(needed.value)
-            if ctypes.windll.winspool.GetDefaultPrinterW(buffer, ctypes.byref(needed)):
-                name = buffer.value.strip()
-                return name if name else None
+            if needed.value > 0:
+                buffer = ctypes.create_unicode_buffer(needed.value)
+                if ctypes.windll.winspool.GetDefaultPrinterW(buffer, ctypes.byref(needed)):
+                    name = buffer.value.strip()
+                    if name:
+                        result_name = name
         except Exception:
             pass
 
         # Fallback: use WMI via PowerShell to get the default printer
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "(Get-CimInstance -ClassName Win32_Printer | Where-Object {$_.Default}).Name"],
-                capture_output=True, text=True, timeout=5,
-            )
-            name = result.stdout.strip()
-            if name:
-                return name
-        except Exception:
-            pass
+        if result_name is None:
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance -ClassName Win32_Printer | Where-Object {$_.Default}).Name"],
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                )
+                name = result.stdout.strip()
+                if name:
+                    result_name = name
+            except Exception:
+                pass
 
-        return None
+        cache["name"] = result_name
+        cache["ts_name"] = _time.monotonic()
+        return result_name
 
     def _enumerate_printers(self) -> list[str]:
         """Return a list of all available printer names on this system."""
+        import time as _time
+        cache = self._printer_cache
+        if "list" in cache and (_time.monotonic() - cache.get("ts_list", 0)) < 10:
+            return cache["list"]
+
         printers = []
         if os.name != "nt":
             return printers
@@ -2162,6 +2180,7 @@ class BlazeBiteApp(ctk.CTk):
                 ["powershell", "-NoProfile", "-Command",
                  "(Get-CimInstance -ClassName Win32_Printer).Name"],
                 capture_output=True, text=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
             )
             for line in result.stdout.strip().splitlines():
                 name = line.strip()
@@ -2170,6 +2189,8 @@ class BlazeBiteApp(ctk.CTk):
         except Exception:
             pass
 
+        cache["list"] = printers
+        cache["ts_list"] = _time.monotonic()
         return printers
 
     # ═══════════════════════════════════════════
@@ -2817,6 +2838,7 @@ class BlazeBiteApp(ctk.CTk):
         ).pack(side="left", padx=(6, 0))
 
         def _refresh_printers():
+            self._printer_cache.clear()  # force fresh lookup
             refreshed = self._enumerate_printers()
             new_default = self._get_default_printer_name()
             vals = refreshed if refreshed else ["(No printers found)"]
