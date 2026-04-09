@@ -1463,10 +1463,170 @@ class BlazeBiteApp(ctk.CTk):
         left.grid(row=0, column=0, sticky="nsew", padx=(0,1))
         self._build_menu_panel(left)
 
-        # Right: order panel
+        # Right: order + history panel
         right = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"], corner_radius=0)
         right.grid(row=0, column=1, sticky="nsew")
-        self._build_order_panel(right)
+
+        # ── Tab bar (Order / History) ──
+        tab_bar = ctk.CTkFrame(right, fg_color=COLORS["bg_card"], corner_radius=0,
+                               height=50, border_width=1, border_color=COLORS["border"])
+        tab_bar.pack(fill="x")
+        tab_bar.pack_propagate(False)
+
+        self._pos_tab_btns = {}
+        self._pos_active_tab = "order"
+
+        for tab_id, label in [("order", "🧾  Order"), ("history", "📋  History")]:
+            btn = ctk.CTkButton(
+                tab_bar, text=label, width=120, height=38, corner_radius=8,
+                fg_color=COLORS["accent"] if tab_id == "order" else "transparent",
+                hover_color=COLORS["accent_glow"],
+                text_color="#0A0E27" if tab_id == "order" else COLORS["text_muted"],
+                font=ctk.CTkFont("Helvetica", 13, "bold"),
+                command=lambda t=tab_id: self._switch_pos_tab(t),
+            )
+            btn.pack(side="left", padx=(14 if tab_id == "order" else 4, 0), pady=6)
+            self._pos_tab_btns[tab_id] = btn
+
+        # ── Order content frame ──
+        self._order_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_panel"], corner_radius=0)
+        self._order_frame.pack(fill="both", expand=True)
+        self._build_order_panel(self._order_frame)
+
+        # ── History content frame (hidden initially) ──
+        self._history_frame = ctk.CTkFrame(right, fg_color=COLORS["bg_panel"], corner_radius=0)
+        self._build_sales_history_panel(self._history_frame)
+
+    def _switch_pos_tab(self, tab: str):
+        self._pos_active_tab = tab
+        for tid, btn in self._pos_tab_btns.items():
+            if tid == tab:
+                btn.configure(fg_color=COLORS["accent"], text_color="#0A0E27")
+            else:
+                btn.configure(fg_color="transparent", text_color=COLORS["text_muted"])
+
+        if tab == "order":
+            self._history_frame.pack_forget()
+            self._order_frame.pack(fill="both", expand=True)
+        else:
+            self._order_frame.pack_forget()
+            self._history_frame.pack(fill="both", expand=True)
+            self._refresh_sales_history()
+
+    # ── Sales History Panel (Attendant) ─────────────────────────
+    def _build_sales_history_panel(self, parent):
+        """Build a styled sales history view for the attendant."""
+        # Summary cards row
+        summary_row = ctk.CTkFrame(parent, fg_color="transparent")
+        summary_row.pack(fill="x", padx=12, pady=(12, 6))
+        summary_row.columnconfigure((0, 1, 2), weight=1)
+
+        self._hist_today_orders = ctk.CTkLabel(summary_row, text="0",
+            font=ctk.CTkFont("Helvetica", 26, "bold"), text_color=COLORS["accent"])
+        self._hist_today_revenue = ctk.CTkLabel(summary_row, text="₵0.00",
+            font=ctk.CTkFont("Helvetica", 26, "bold"), text_color=COLORS["success"])
+        self._hist_today_avg = ctk.CTkLabel(summary_row, text="₵0.00",
+            font=ctk.CTkFont("Helvetica", 26, "bold"), text_color=COLORS["gold"])
+
+        for col, (val_lbl, title, icon) in enumerate([
+            (self._hist_today_orders, "Today's Orders", "🛒"),
+            (self._hist_today_revenue, "Today's Revenue", "💰"),
+            (self._hist_today_avg,     "Avg. Order",     "📊"),
+        ]):
+            card = ctk.CTkFrame(summary_row, fg_color=COLORS["bg_card"],
+                                corner_radius=12, border_width=1,
+                                border_color=COLORS["border"])
+            card.grid(row=0, column=col, sticky="nsew", padx=4)
+            ctk.CTkLabel(card, text=f"{icon}  {title}",
+                         font=ctk.CTkFont("Helvetica", 11),
+                         text_color=COLORS["text_muted"]).pack(anchor="w", padx=14, pady=(10, 0))
+            val_lbl.destroy()
+            val_lbl_new = ctk.CTkLabel(card, text=val_lbl.cget("text"),
+                font=val_lbl.cget("font"), text_color=val_lbl.cget("text_color"))
+            val_lbl_new.pack(anchor="w", padx=14, pady=(2, 10))
+            if col == 0:
+                self._hist_today_orders = val_lbl_new
+            elif col == 1:
+                self._hist_today_revenue = val_lbl_new
+            else:
+                self._hist_today_avg = val_lbl_new
+
+        # Transactions list header
+        list_hdr = ctk.CTkFrame(parent, fg_color="transparent", height=32)
+        list_hdr.pack(fill="x", padx=16, pady=(10, 2))
+        list_hdr.pack_propagate(False)
+        ctk.CTkLabel(list_hdr, text="Recent Transactions",
+                     font=ctk.CTkFont("Helvetica", 13, "bold"),
+                     text_color=COLORS["text_primary"]).pack(side="left")
+
+        # Scrollable transaction list
+        self._hist_scroll = ctk.CTkScrollableFrame(
+            parent, fg_color="transparent",
+            scrollbar_button_color=COLORS["border"],
+            scrollbar_button_hover_color=COLORS["accent_soft"])
+        self._hist_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def _refresh_sales_history(self):
+        """Populate the history panel with attendant's sales data."""
+        store = getattr(self, "active_store", None)
+
+        # Update summary cards
+        summary = self.db.get_today_summary(store=store)
+        count, revenue = summary if summary else (0, 0)
+        avg = revenue / count if count else 0
+        self._hist_today_orders.configure(text=str(count))
+        self._hist_today_revenue.configure(text=f"₵{revenue:,.2f}")
+        self._hist_today_avg.configure(text=f"₵{avg:,.2f}")
+
+        # Clear old cards
+        for w in self._hist_scroll.winfo_children():
+            w.destroy()
+
+        # Fetch recent transactions (last 50)
+        txns = self.db.get_all_transactions(store=store)[:50]
+        if not txns:
+            ctk.CTkLabel(self._hist_scroll, text="No transactions yet",
+                         font=ctk.CTkFont("Helvetica", 13),
+                         text_color=COLORS["text_muted"]).pack(pady=40)
+            return
+
+        for tx in txns:
+            # tx: (id, date, time, items_json, subtotal, tax, total, payment_method, order_number, ...)
+            tx_id, tx_date, tx_time, items_json, subtotal, tax, total, pay_method, order_num = tx[:9]
+            items = json.loads(items_json)
+
+            card = ctk.CTkFrame(self._hist_scroll, fg_color=COLORS["bg_card"],
+                                corner_radius=10, border_width=1,
+                                border_color=COLORS["border"])
+            card.pack(fill="x", pady=3, padx=4)
+
+            # Top row: order#, time, total
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x", padx=12, pady=(8, 0))
+            ctk.CTkLabel(top, text=f"# {order_num:04d}",
+                         font=ctk.CTkFont("Helvetica", 13, "bold"),
+                         text_color=COLORS["accent"]).pack(side="left")
+            ctk.CTkLabel(top, text=f"{tx_date}  {tx_time}",
+                         font=ctk.CTkFont("Helvetica", 11),
+                         text_color=COLORS["text_muted"]).pack(side="left", padx=10)
+            ctk.CTkLabel(top, text=f"₵{total:,.2f}",
+                         font=ctk.CTkFont("Helvetica", 14, "bold"),
+                         text_color=COLORS["success"]).pack(side="right")
+
+            # Payment badge
+            badge_color = COLORS["accent_soft"] if pay_method == "Cash" else COLORS["gold"]
+            ctk.CTkLabel(top, text=pay_method,
+                         font=ctk.CTkFont("Helvetica", 10),
+                         text_color=badge_color).pack(side="right", padx=8)
+
+            # Items row
+            items_text = ", ".join(f"{it['name']} ×{it['qty']}" for it in items)
+            if len(items_text) > 70:
+                items_text = items_text[:67] + "..."
+            ctk.CTkLabel(card, text=items_text,
+                         font=ctk.CTkFont("Helvetica", 11),
+                         text_color=COLORS["text_secondary"],
+                         anchor="w").pack(fill="x", padx=12, pady=(2, 8))
 
     # ── Category tabs ──
     def _build_menu_panel(self, parent):
@@ -1790,19 +1950,15 @@ class BlazeBiteApp(ctk.CTk):
     #  ORDER PANEL
     # ─────────────────────────────────────────
     def _build_order_panel(self, parent):
-        # Header
-        hdr = ctk.CTkFrame(parent, fg_color=COLORS["bg_card"], corner_radius=0, height=58,
-                           border_width=1, border_color=COLORS["border"])
+        # Clear All button bar
+        hdr = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"], corner_radius=0, height=42)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text="🧾  Current Order",
-                     font=ctk.CTkFont("Helvetica", 16, "bold"),
-                     text_color=COLORS["text_primary"]).pack(side="left", padx=18, pady=12)
-        ctk.CTkButton(hdr, text="Clear All", width=90, height=34,
+        ctk.CTkButton(hdr, text="🗑  Clear All", width=100, height=30,
                       fg_color=COLORS["error"], hover_color="#DC2626",
                       text_color="white", corner_radius=8,
                       font=ctk.CTkFont("Helvetica", 11, "bold"),
-                      command=self._clear_order).pack(side="right", padx=14, pady=12)
+                      command=self._clear_order).pack(side="right", padx=14, pady=6)
 
         # Scrollable order list
         self.order_scroll = ctk.CTkScrollableFrame(
@@ -1842,7 +1998,7 @@ class BlazeBiteApp(ctk.CTk):
                      font=ctk.CTkFont("Helvetica", 13, "bold"),
                      text_color=COLORS["text_primary"]).pack(side="left", padx=18, pady=12)
         self.payment_var = ctk.StringVar(value="Cash")
-        for method in ["Cash", "Card", "Mobile"]:
+        for method in ["Cash", "Card", "Mobile Money"]:
             ctk.CTkRadioButton(
                 pay_frame, text=method, variable=self.payment_var,
                 value=method,
