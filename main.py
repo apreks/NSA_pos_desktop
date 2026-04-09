@@ -1152,6 +1152,9 @@ class BlazeBiteApp(ctk.CTk):
         # ── Build UI ──
         self._build_layout()
 
+        # Pre-warm printer cache in background (instant receipt window later)
+        threading.Thread(target=self._prewarm_printer_cache, daemon=True).start()
+
         # Show login immediately
         self._show_login()
 
@@ -2120,6 +2123,14 @@ class BlazeBiteApp(ctk.CTk):
 
     _printer_cache: dict = {}   # {"name": ..., "list": ..., "ts": float}
 
+    def _prewarm_printer_cache(self):
+        """Pre-warm the printer cache in a background thread."""
+        try:
+            self._get_default_printer_name()
+            self._enumerate_printers()
+        except Exception:
+            pass
+
     def _get_default_printer_name(self) -> str | None:
         """Return the default Windows printer name, or None if unavailable."""
         # Return cached value if fresh (< 10 s)
@@ -2283,7 +2294,9 @@ class BlazeBiteApp(ctk.CTk):
             items, subtotal, tax, total, payment,
             cash_tendered, change, order_number, cashier, store, timestamp
         """
-        printer_name = printer_name or self._get_default_printer_name()
+        # Use cached printer name if available (never block for lookup)
+        if printer_name is None:
+            printer_name = self._printer_cache.get("name")
         W = self._get_receipt_profile(printer_name)["line_width"]
 
         items          = order_data["items"]
@@ -2388,7 +2401,7 @@ class BlazeBiteApp(ctk.CTk):
         Uses the printer's own alignment commands (ESC a) and BUSINESS_INFO
         dict so the layout stays in sync with _build_invoice.
         """
-        profile = self._get_receipt_profile(self._get_default_printer_name())
+        profile = self._get_receipt_profile(self._printer_cache.get("name"))
         W = profile["line_width"]
         mm = profile["mm"]
 
@@ -2597,7 +2610,7 @@ class BlazeBiteApp(ctk.CTk):
     def _save_invoice_pdf(self, invoice_text: str, output_path: str,
                           order_data: dict | None = None):
         """Render receipt text to a receipt-width PDF with bold headers."""
-        profile = self._get_receipt_profile(self._get_default_printer_name())
+        profile = self._get_receipt_profile(self._printer_cache.get("name"))
         W = profile["line_width"]
         mm = profile["mm"]
 
@@ -2669,7 +2682,7 @@ class BlazeBiteApp(ctk.CTk):
 
         biz = BUSINESS_INFO
         fm  = self._fmt_money
-        profile = self._get_receipt_profile(self._get_default_printer_name())
+        profile = self._get_receipt_profile(self._printer_cache.get("name"))
         W   = profile["line_width"]
         mm  = profile["mm"]
         SEP = "=" * W
@@ -2799,8 +2812,9 @@ class BlazeBiteApp(ctk.CTk):
             return False, f"python-escpos error: {e}"
 
     def _show_invoice_window(self, invoice: str, order_data: dict | None = None):
-        default_printer = self._get_default_printer_name()
-        all_printers = self._enumerate_printers()
+        # Use cached values instantly (pre-warmed at startup) – never block
+        default_printer = self._printer_cache.get("name")
+        all_printers = self._printer_cache.get("list", [])
         active_profile = self._get_receipt_profile(default_printer)
         selected_mode = getattr(self, "receipt_paper_profile", "Auto")
         if selected_mode == "Auto":
@@ -2846,7 +2860,7 @@ class BlazeBiteApp(ctk.CTk):
                      font=ctk.CTkFont("Helvetica", 11, "bold"),
                      text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 8))
 
-        printer_values = all_printers if all_printers else ["(No printers found)"]
+        printer_values = all_printers if all_printers else ["(Detecting...)"]
         printer_var = tk.StringVar(value=default_printer if default_printer else printer_values[0])
         printer_combo = ctk.CTkComboBox(
             printer_row, values=printer_values, variable=printer_var,
@@ -2858,6 +2872,22 @@ class BlazeBiteApp(ctk.CTk):
             font=ctk.CTkFont("Helvetica", 11),
         )
         printer_combo.pack(side="left", fill="x", expand=True)
+
+        # If printer cache was empty, refresh in background
+        if not all_printers:
+            def _bg_detect():
+                self._prewarm_printer_cache()
+                detected = self._printer_cache.get("list", [])
+                dp = self._printer_cache.get("name")
+                def _update():
+                    vals = detected if detected else ["(No printers found)"]
+                    printer_combo.configure(values=vals)
+                    if dp and dp in vals:
+                        printer_var.set(dp)
+                    elif vals:
+                        printer_var.set(vals[0])
+                win.after(0, _update)
+            threading.Thread(target=_bg_detect, daemon=True).start()
 
         ctk.CTkButton(
             printer_row, text="⟳", width=32, height=32, corner_radius=8,
