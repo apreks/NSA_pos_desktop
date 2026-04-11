@@ -11,6 +11,7 @@ import datetime
 import os
 import sys
 import json
+import csv
 import re
 import subprocess
 import ctypes
@@ -49,7 +50,7 @@ ADMIN_PASSWORD = "admin123"
 #  BUSINESS / RECEIPT HEADER INFO
 # ─────────────────────────────────────────────
 BUSINESS_INFO = {
-    "name":           "NSA RESTAURANT",
+    "name":           "National Service Authority",
     "tagline":        "Point of Sale",
     "address_line1":  "46 Patrice Lumumba Rd, Airport",
     "address_line2":  "P.O. Box 46, State House - Accra",
@@ -141,9 +142,12 @@ STORE_MENUS = {
 }
 
 STORE_LABELS = {
-    "fast_food": "Fast Food",
-    "cold_store": "Cold Store",
+    "fast_food": "NSA Fast Food",
+    "cold_store": "NSA Papao/Frozen Foods",
 }
+
+# Reverse lookup: display label → store key
+STORE_KEYS = {v: k for k, v in STORE_LABELS.items()}
 
 # Simple credential store for attendant/admin access per store
 CREDENTIALS = {
@@ -224,11 +228,13 @@ class Database:
         # Ensure schema has store information for filtering by POS
         self._ensure_column("transactions", "store", "TEXT", default="fast_food")
         self._ensure_column("products", "store", "TEXT", default="fast_food")
+        self._ensure_column("transactions", "cashier", "TEXT", default="")
         self._ensure_column("products", "quantity", "INTEGER", default=0)
         self._ensure_column("products", "archived", "INTEGER", default=0)
         self._ensure_column("products", "barcode", "TEXT", default="")
         self._ensure_column("users", "disabled", "INTEGER", default=0)
         self._ensure_column("users", "must_change_password", "INTEGER", default=0)
+        self._ensure_column("transactions", "client_name", "TEXT", default="")
 
     def _has_column(self, table: str, column: str) -> bool:
         cur = self.conn.execute(f"PRAGMA table_info({table})")
@@ -248,12 +254,13 @@ class Database:
             self.conn.commit()
 
     def save_transaction(self, items: list, subtotal: float, tax: float,
-                         total: float, payment_method: str, order_number: int, store: str = "fast_food"):
+                         total: float, payment_method: str, order_number: int,
+                         store: str = "fast_food", client_name: str = "", cashier: str = ""):
         now = datetime.datetime.now()
         self.conn.execute("""
             INSERT INTO transactions
-            (date, time, items_json, subtotal, tax, total, payment_method, order_number, store)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (date, time, items_json, subtotal, tax, total, payment_method, order_number, store, client_name, cashier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now.strftime("%Y-%m-%d"),
             now.strftime("%H:%M:%S"),
@@ -264,6 +271,8 @@ class Database:
             payment_method,
             order_number,
             store,
+            client_name,
+            cashier,
         ))
         self.conn.commit()
 
@@ -304,6 +313,23 @@ class Database:
                 SELECT COUNT(*), COALESCE(SUM(total),0)
                 FROM transactions WHERE date = ?
             """, (today,))
+        return cur.fetchone()
+
+    def get_monthly_summary(self, store: str | None = None):
+        """Return (order_count, total_revenue) for the current calendar month."""
+        now = datetime.date.today()
+        month_start = now.replace(day=1).isoformat()
+        month_end = now.isoformat()
+        if store:
+            cur = self.conn.execute("""
+                SELECT COUNT(*), COALESCE(SUM(total),0)
+                FROM transactions WHERE date >= ? AND date <= ? AND store = ?
+            """, (month_start, month_end, store))
+        else:
+            cur = self.conn.execute("""
+                SELECT COUNT(*), COALESCE(SUM(total),0)
+                FROM transactions WHERE date >= ? AND date <= ?
+            """, (month_start, month_end))
         return cur.fetchone()
 
     def get_daily_totals(self, limit=7, store: str | None = None):
@@ -555,7 +581,8 @@ class Database:
 
     def get_item_report(self, item_name: str, date_from: str, date_to: str,
                         store: str | None = None):
-        """Return (total_qty, total_revenue) for a named item between two ISO dates."""
+        """Return (total_qty, total_revenue) for a named item between two ISO dates.
+        If item_name is 'All Items', aggregate across all items."""
         if store:
             rows = self.conn.execute(
                 "SELECT items_json FROM transactions WHERE date >= ? AND date <= ? AND store = ?",
@@ -568,9 +595,10 @@ class Database:
             ).fetchall()
         total_qty = 0
         total_rev = 0.0
+        all_items = item_name.strip().lower() == "all items"
         for (items_json,) in rows:
             for it in json.loads(items_json):
-                if it["name"].strip().lower() == item_name.strip().lower():
+                if all_items or it["name"].strip().lower() == item_name.strip().lower():
                     total_qty += it["qty"]
                     total_rev += it["price"] * it["qty"]
         return total_qty, total_rev
@@ -1619,6 +1647,14 @@ class BlazeBiteApp(ctk.CTk):
                          font=ctk.CTkFont("Helvetica", 10),
                          text_color=badge_color).pack(side="right", padx=8)
 
+            # Reprint button
+            ctk.CTkButton(top, text="🖨 Reprint", width=80, height=26,
+                          corner_radius=6,
+                          fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                          text_color=COLORS["text_primary"],
+                          font=ctk.CTkFont("Helvetica", 10),
+                          command=lambda t=tx: self._reprint_receipt(t)).pack(side="right", padx=4)
+
             # Items row
             items_text = ", ".join(f"{it['name']} ×{it['qty']}" for it in items)
             if len(items_text) > 70:
@@ -1652,6 +1688,13 @@ class BlazeBiteApp(ctk.CTk):
                                          font=ctk.CTkFont("Helvetica", 11))
         self.search_entry.pack(side="left", padx=5, pady=8)
         self.search_entry.bind("<Return>", lambda _: self._perform_search())
+        self.search_entry.bind("<KeyRelease>", lambda _: self._on_search_key())
+        self.search_entry.bind("<FocusOut>", lambda _: self.after(150, self._hide_suggestions))
+
+        # Autocomplete dropdown (floating toplevel so it never covers menu tiles)
+        self._suggestion_win = None
+        self._suggestion_list = None
+        self._suggestion_items = []
 
         # Search button
         search_btn = ctk.CTkButton(search_frame, text="Search",
@@ -1841,6 +1884,7 @@ class BlazeBiteApp(ctk.CTk):
         self.search_var.set("")
         self.search_active = False
         self.search_results = []
+        self._hide_suggestions()
 
         # Clear menu scroll
         for widget in self.menu_scroll.winfo_children():
@@ -1849,6 +1893,92 @@ class BlazeBiteApp(ctk.CTk):
         # Show the active category
         if self.active_category:
             self._render_category(self.active_category)
+
+    # ── Live search suggestion helpers ────────────────────────
+    def _ensure_suggestion_win(self):
+        """Create (or re-create) the floating suggestion dropdown."""
+        if self._suggestion_win and self._suggestion_win.winfo_exists():
+            return
+        win = tk.Toplevel(self)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(bg=COLORS["border"])
+        win.wm_attributes("-topmost", True)
+
+        lb = tk.Listbox(
+            win, bg=COLORS["bg_card"], fg=COLORS["text_primary"],
+            selectbackground=COLORS["accent"], selectforeground="#0A0E27",
+            font=("Helvetica", 11), relief="flat", borderwidth=0,
+            highlightthickness=0, exportselection=False,
+            activestyle="none",
+        )
+        lb.pack(fill="both", expand=True, padx=1, pady=1)
+        lb.bind("<<ListboxSelect>>", self._on_suggestion_select)
+        self._suggestion_win = win
+        self._suggestion_list = lb
+
+    def _on_search_key(self):
+        """Show matching items in a dropdown as the user types."""
+        query = self.search_var.get().strip().lower()
+        if len(query) < 1:
+            self._hide_suggestions()
+            return
+
+        matches = []
+        for category, items in self.menu_data.items():
+            for item in items:
+                if query in item["name"].lower() or query in item.get("desc", "").lower():
+                    matches.append(item)
+                if len(matches) >= 15:
+                    break
+            if len(matches) >= 15:
+                break
+
+        if not matches:
+            self._hide_suggestions()
+            return
+
+        self._ensure_suggestion_win()
+        self._suggestion_items = matches
+        lb = self._suggestion_list
+        lb.delete(0, tk.END)
+        for item in matches:
+            lb.insert(tk.END, f"  {item['name']}  —  ₵{item['price']:.2f}")
+
+        # Position directly below the search entry using screen coords
+        try:
+            entry = self.search_entry
+            entry.update_idletasks()
+            x = entry.winfo_rootx()
+            y = entry.winfo_rooty() + entry.winfo_height() + 2
+            w = max(entry.winfo_width() + 120, 340)
+            row_h = 24
+            h = min(len(matches) * row_h + 4, 300)
+            self._suggestion_win.geometry(f"{w}x{h}+{x}+{y}")
+            self._suggestion_win.deiconify()
+        except Exception:
+            pass
+
+    def _hide_suggestions(self):
+        """Hide the search suggestion dropdown."""
+        try:
+            if self._suggestion_win and self._suggestion_win.winfo_exists():
+                self._suggestion_win.withdraw()
+        except Exception:
+            pass
+
+    def _on_suggestion_select(self, event):
+        """When user clicks a suggestion, add the item to the order."""
+        lb = self._suggestion_list
+        sel = lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx < len(self._suggestion_items):
+            self._add_item(self._suggestion_items[idx])
+        self._hide_suggestions()
+        self.search_var.set("")
+        self.search_entry.focus_set()
 
     def _on_barcode_scan(self):
         """Handle barcode scanner input — look up product and add to cart."""
@@ -1990,6 +2120,27 @@ class BlazeBiteApp(ctk.CTk):
             lbl.pack(side="right")
             setattr(self, val_attr, lbl)
 
+        # Client / Receiver name
+        client_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"], corner_radius=0,
+                                    border_width=1, border_color=COLORS["border"])
+        client_frame.pack(fill="x", padx=0, pady=(1, 0))
+        ctk.CTkLabel(client_frame, text="Client/Receiver:",
+                     font=ctk.CTkFont("Helvetica", 13, "bold"),
+                     text_color=COLORS["text_primary"]).pack(side="left", padx=(18, 10), pady=12)
+        self.client_name_var = ctk.StringVar(value="")
+        self.client_name_entry = ctk.CTkEntry(
+            client_frame,
+            textvariable=self.client_name_var,
+            width=220,
+            height=34,
+            fg_color=COLORS["bg_card"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            placeholder_text="Enter client/receiver name (optional)",
+            font=ctk.CTkFont("Helvetica", 11),
+        )
+        self.client_name_entry.pack(side="left", padx=(0, 12), pady=10, fill="x", expand=True)
+
         # Payment method
         pay_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"], corner_radius=0,
                                  border_width=1, border_color=COLORS["border"])
@@ -2093,6 +2244,8 @@ class BlazeBiteApp(ctk.CTk):
     def _clear_order(self):
         self.order_items.clear()
         self.cash_tendered_var.set("")
+        if hasattr(self, "client_name_var"):
+            self.client_name_var.set("")
         self._refresh_order_panel()
 
     def _refresh_order_panel(self):
@@ -2245,9 +2398,13 @@ class BlazeBiteApp(ctk.CTk):
         items_list = [{"name": n, "price": d["price"], "qty": d["qty"]}
                       for n, d in self.order_items.items()]
 
+        client_name = self.client_name_var.get().strip() if hasattr(self, "client_name_var") else ""
+
         # Save to DB (store-specific)
         self.db.save_transaction(items_list, subtotal, tax, total,
-                                 payment, self.order_counter, store=self.active_store)
+                                 payment, self.order_counter, store=self.active_store,
+                                 client_name=client_name,
+                                 cashier=self.current_user or "")
         self.db.log_activity(
             self.current_user or "unknown",
             self.current_role or "unknown",
@@ -2266,6 +2423,7 @@ class BlazeBiteApp(ctk.CTk):
             "cashier": self.current_user or "—",
             "store": STORE_LABELS.get(self.active_store, self.active_store or "—"),
             "timestamp": datetime.datetime.now(),
+            "client_name": client_name,
         }
         invoice = self._build_invoice(order_data)
 
@@ -2495,6 +2653,9 @@ class BlazeBiteApp(ctk.CTk):
         lines.append(lr("Order:", f"#{order_number:04d}", W))
         lines.append(lr("Cashier:", cashier, W))
         lines.append(lr("Store:", store, W))
+        client_name = order_data.get("client_name", "")
+        if client_name:
+            lines.append(lr("Client:", client_name, W))
         lines.append(MID)
 
         # ── Column header: ITEM | QTY | PRICE | AMOUNT ──
@@ -2651,6 +2812,9 @@ class BlazeBiteApp(ctk.CTk):
         lr("Order:", f"#{order_number:04d}")
         lr("Cashier:", cashier)
         lr("Store:", store)
+        client_name = order_data.get("client_name", "")
+        if client_name:
+            lr("Client:", client_name)
         left_mid()
 
         # ── Column header & items ──
@@ -2967,6 +3131,70 @@ class BlazeBiteApp(ctk.CTk):
                 pass
             return False, f"python-escpos error: {e}"
 
+    def _reprint_receipt(self, tx_row):
+        """Reconstruct order_data from a transaction row and show the receipt window."""
+        # tx: (id, date, time, items_json, subtotal, tax, total, payment_method, order_number, store, client_name?, cashier?)
+        tx_id = tx_row[0]
+        tx_date = tx_row[1]
+        tx_time = tx_row[2]
+        items = json.loads(tx_row[3])
+        subtotal = tx_row[4]
+        tax = tx_row[5]
+        total = tx_row[6]
+        payment = tx_row[7]
+        order_number = tx_row[8]
+        store_key = tx_row[9] if len(tx_row) > 9 else "fast_food"
+        client_name = tx_row[10] if len(tx_row) > 10 else ""
+        cashier = tx_row[11] if len(tx_row) > 11 else ""
+
+        try:
+            ts = datetime.datetime.strptime(f"{tx_date} {tx_time}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            ts = datetime.datetime.now()
+
+        order_data = {
+            "items": items,
+            "subtotal": subtotal,
+            "tax": tax,
+            "total": total,
+            "payment": payment,
+            "cash_tendered": None,
+            "change": None,
+            "order_number": order_number,
+            "cashier": cashier or "—",
+            "store": STORE_LABELS.get(store_key, store_key or "—"),
+            "timestamp": ts,
+            "client_name": client_name or "",
+        }
+        invoice = self._build_invoice(order_data)
+        self._show_invoice_window(invoice, order_data)
+
+    def _reprint_selected_admin_tx(self):
+        """Reprint the receipt for the transaction selected in the admin Treeview."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select a transaction row to reprint.")
+            return
+        vals = self.tree.item(sel[0], "values")
+        # vals: ("#0001", "2025-04-10", "14:30:00", "items...", "₵xx", "₵xx", "₵xx", "Cash")
+        order_num_str = vals[0].replace("#", "").strip()
+        try:
+            order_num = int(order_num_str)
+        except ValueError:
+            messagebox.showerror("Error", "Could not parse order number.")
+            return
+        # Look up original transaction row by order number and store
+        txs = self.db.get_all_transactions(store=self.active_store)
+        tx_row = None
+        for tx in txs:
+            if tx[8] == order_num:
+                tx_row = tx
+                break
+        if not tx_row:
+            messagebox.showerror("Not Found", f"Transaction #{order_num:04d} not found.")
+            return
+        self._reprint_receipt(tx_row)
+
     def _show_invoice_window(self, invoice: str, order_data: dict | None = None):
         # Use cached values instantly (pre-warmed at startup) – never block
         default_printer = self._printer_cache.get("name")
@@ -2984,7 +3212,15 @@ class BlazeBiteApp(ctk.CTk):
 
         win = ctk.CTkToplevel(self)
         win.title(f"Receipt #{order_num:04d}")
-        win.geometry("540x750")
+        # Responsive: fit within available screen
+        scr_w = win.winfo_screenwidth()
+        scr_h = win.winfo_screenheight()
+        dlg_w = min(540, scr_w - 40)
+        dlg_h = min(750, scr_h - 80)
+        x = (scr_w - dlg_w) // 2
+        y = max(0, (scr_h - dlg_h) // 2 - 20)
+        win.geometry(f"{dlg_w}x{dlg_h}+{x}+{y}")
+        win.minsize(380, 400)
         win.configure(fg_color=COLORS["bg_dark"])
         win.grab_set()
 
@@ -3305,7 +3541,21 @@ class BlazeBiteApp(ctk.CTk):
                       fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
                       text_color=COLORS["text_secondary"],
                       font=ctk.CTkFont("Helvetica", 11),
-                      command=self._clear_tx_filter).pack(side="left", padx=(0, 10), pady=10)
+                      command=self._clear_tx_filter).pack(side="left", padx=(0, 6), pady=10)
+
+        ctk.CTkButton(filter_bar, text="📄 Export PDF",
+                      width=110, height=34, corner_radius=8,
+                      fg_color=COLORS["success"], hover_color="#059669",
+                      text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._export_sales_pdf).pack(side="left", padx=(0, 6), pady=10)
+
+        ctk.CTkButton(filter_bar, text="🖨 Print Sales",
+                      width=110, height=34, corner_radius=8,
+                      fg_color=COLORS["warning"], hover_color="#D97706",
+                      text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._print_sales_report).pack(side="left", padx=(0, 10), pady=10)
 
         self._tx_count_lbl = ctk.CTkLabel(filter_bar, text="",
                                            font=ctk.CTkFont("Helvetica", 10),
@@ -3352,6 +3602,16 @@ class BlazeBiteApp(ctk.CTk):
         self.tree.configure(yscrollcommand=scroll_y.set)
         scroll_y.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Reprint selected transaction
+        reprint_row = ctk.CTkFrame(admin_scroll, fg_color="transparent")
+        reprint_row.pack(fill="x", padx=16, pady=(0, 4))
+        ctk.CTkButton(reprint_row, text="🖨  Reprint Selected Receipt",
+                      width=220, height=34, corner_radius=8,
+                      fg_color=COLORS["accent_soft"], hover_color=COLORS["accent"],
+                      text_color="white",
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      command=self._reprint_selected_admin_tx).pack(side="left")
 
         # Product management
         prod_lbl = ctk.CTkLabel(admin_scroll, text="🛠️  Product Management",
@@ -3769,9 +4029,9 @@ class BlazeBiteApp(ctk.CTk):
         self.root_items_store_var = tk.StringVar(value="All")
         ctk.CTkComboBox(
             root_items_filter_row,
-            width=150,
+            width=220,
             height=30,
-            values=["All", "Fast Food", "Cold Store"],
+            values=["All"] + list(STORE_LABELS.values()),
             variable=self.root_items_store_var,
             command=lambda _v: self._on_root_items_store_change(),
             fg_color=COLORS["bg_hover"],
@@ -3820,6 +4080,17 @@ class BlazeBiteApp(ctk.CTk):
             command=lambda: self._set_selected_system_item_archive(self.root_items_tree, False),
         ).pack(side="left")
 
+        ctk.CTkButton(
+            root_item_actions,
+            text="📤 Bulk Upload",
+            height=30,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_glow"],
+            text_color="#0A0E27",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._bulk_upload_products,
+        ).pack(side="left", padx=(6, 0))
+
         # ─── Category Management ──────────────────────────────
         cat_section = ctk.CTkFrame(root_scroll, fg_color=COLORS["bg_card"], corner_radius=10,
                                    border_width=1, border_color=COLORS["border"])
@@ -3849,8 +4120,8 @@ class BlazeBiteApp(ctk.CTk):
 
         self.root_cat_store_var = tk.StringVar(value="All")
         ctk.CTkComboBox(
-            cat_filter_row, width=150, height=30,
-            values=["All", "Fast Food", "Cold Store"],
+            cat_filter_row, width=220, height=30,
+            values=["All"] + list(STORE_LABELS.values()),
             variable=self.root_cat_store_var,
             command=lambda _v: self._refresh_root_categories(),
             fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
@@ -4501,13 +4772,12 @@ class BlazeBiteApp(ctk.CTk):
 
         ctk.CTkLabel(dialog, text="Store:").pack(pady=(4, 4))
         store_var = tk.StringVar(value="All Stores")
-        ctk.CTkComboBox(dialog, values=["All Stores", "Fast Food", "Cold Store"],
+        ctk.CTkComboBox(dialog, values=["All Stores"] + list(STORE_LABELS.values()),
                         variable=store_var, width=250).pack(padx=20)
 
         def confirm_reset():
             choice = store_var.get()
-            store_map = {"Fast Food": "fast_food", "Cold Store": "cold_store"}
-            store_key = store_map.get(choice, None)  # None means all
+            store_key = STORE_KEYS.get(choice, None)  # None means all
 
             label = choice
             if not messagebox.askyesno(
@@ -4568,6 +4838,138 @@ class BlazeBiteApp(ctk.CTk):
         self._tx_to_var.set("")
         self._populate_tx_table()
 
+    def _get_filtered_transactions(self):
+        """Return transactions matching the current date filter."""
+        from_str = self._tx_from_var.get().strip()
+        to_str   = self._tx_to_var.get().strip()
+        if from_str or to_str:
+            f = from_str or "0001-01-01"
+            t = to_str   or "9999-12-31"
+            return self.db.get_transactions_by_date_range(f, t, store=self.active_store)
+        return self.db.get_all_transactions(store=self.active_store)
+
+    def _build_sales_report_text(self, txs):
+        """Build a plain-text sales summary report from a list of transactions."""
+        from_str = self._tx_from_var.get().strip() or "All time"
+        to_str   = self._tx_to_var.get().strip() or "Present"
+        store_label = STORE_LABELS.get(self.active_store, self.active_store or "All")
+        now = datetime.datetime.now()
+
+        total_revenue = sum(tx[6] for tx in txs)
+        total_tax = sum(tx[5] for tx in txs)
+        total_subtotal = sum(tx[4] for tx in txs)
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append(f"{'SALES REPORT':^60}")
+        lines.append(f"{BUSINESS_INFO['name']:^60}")
+        lines.append("=" * 60)
+        lines.append(f"Store:     {store_label}")
+        lines.append(f"Period:    {from_str}  to  {to_str}")
+        lines.append(f"Generated: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Total Transactions: {len(txs)}")
+        lines.append("-" * 60)
+        lines.append(f"{'#':<8} {'Date':<12} {'Time':<10} {'Items':<18} {'Total':>10}")
+        lines.append("-" * 60)
+
+        for tx in txs:
+            order_num = tx[8]
+            date = tx[1]
+            time = tx[2]
+            items = json.loads(tx[3])
+            total = tx[6]
+            items_str = ", ".join(f"{i['qty']}x{i['name']}" for i in items)
+            if len(items_str) > 17:
+                items_str = items_str[:14] + "..."
+            lines.append(f"#{order_num:<7d} {date:<12} {time:<10} {items_str:<18} GHS{total:>8,.2f}")
+
+        lines.append("=" * 60)
+        lines.append(f"{'Subtotal:':<48} GHS{total_subtotal:>8,.2f}")
+        lines.append(f"{'Tax:':<48} GHS{total_tax:>8,.2f}")
+        lines.append(f"{'TOTAL REVENUE:':<48} GHS{total_revenue:>8,.2f}")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    def _export_sales_pdf(self):
+        """Export current filtered transactions as a PDF sales report."""
+        txs = self._get_filtered_transactions()
+        if not txs:
+            messagebox.showinfo("No Data", "No transactions to export for the selected period.")
+            return
+
+        from tkinter import filedialog
+        from_str = self._tx_from_var.get().strip() or "all"
+        to_str   = self._tx_to_var.get().strip() or "now"
+        default_name = f"SalesReport_{from_str}_to_{to_str}.pdf"
+        filepath = filedialog.asksaveasfilename(
+            title="Save Sales Report",
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")],
+            initialfile=default_name,
+        )
+        if not filepath:
+            return
+
+        report_text = self._build_sales_report_text(txs)
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import mm
+            c_pdf = canvas.Canvas(filepath, pagesize=A4)
+            width, height = A4
+            y = height - 30 * mm
+            c_pdf.setFont("Courier", 8)
+            for line in report_text.split("\n"):
+                if y < 20 * mm:
+                    c_pdf.showPage()
+                    c_pdf.setFont("Courier", 8)
+                    y = height - 20 * mm
+                c_pdf.drawString(15 * mm, y, line)
+                y -= 10
+            c_pdf.save()
+            messagebox.showinfo("Exported", f"Sales report saved to:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+
+    def _print_sales_report(self):
+        """Print the current filtered sales report."""
+        txs = self._get_filtered_transactions()
+        if not txs:
+            messagebox.showinfo("No Data", "No transactions to print for the selected period.")
+            return
+
+        report_text = self._build_sales_report_text(txs)
+        # Save as temp PDF and print
+        app_data_dir = get_app_data_dir()
+        from_str = self._tx_from_var.get().strip() or "all"
+        to_str   = self._tx_to_var.get().strip() or "now"
+        pdf_path = os.path.join(app_data_dir, f"sales_report_{from_str}_{to_str}.pdf")
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import mm
+            c_pdf = canvas.Canvas(pdf_path, pagesize=A4)
+            width, height = A4
+            y = height - 30 * mm
+            c_pdf.setFont("Courier", 8)
+            for line in report_text.split("\n"):
+                if y < 20 * mm:
+                    c_pdf.showPage()
+                    c_pdf.setFont("Courier", 8)
+                    y = height - 20 * mm
+                c_pdf.drawString(15 * mm, y, line)
+                y -= 10
+            c_pdf.save()
+            # Try to print; fall back to just opening the PDF
+            try:
+                os.startfile(pdf_path, "print")
+                messagebox.showinfo("Printing", "Sales report sent to printer.")
+            except OSError:
+                os.startfile(pdf_path)
+                messagebox.showinfo("PDF Opened",
+                                    "Could not send directly to printer.\n"
+                                    "The report PDF has been opened — use Ctrl+P to print.")
+        except Exception as e:
+            messagebox.showerror("Print Failed", str(e))
+
     def _populate_tx_table(self):
         """Fill the transaction Treeview respecting any active date filter."""
         from_str = self._tx_from_var.get().strip()
@@ -4609,14 +5011,17 @@ class BlazeBiteApp(ctk.CTk):
             widget.destroy()
 
         today_orders, today_revenue = self.db.get_today_summary(store=self.active_store)
+        month_orders, month_revenue = self.db.get_monthly_summary(store=self.active_store)
         top_items = self.db.get_top_items(3, store=self.active_store)
         all_tx = self.db.get_all_transactions(store=self.active_store)
         all_revenue = sum(r[6] for r in all_tx)
 
+        month_label = datetime.date.today().strftime("%b %Y")
         card_data = [
             ("📦  Today's Orders",   str(today_orders),     COLORS["accent_glow"]),
             ("💰  Today's Revenue",  f"₵{today_revenue:.2f}", COLORS["success"]),
-            ("🏆  All-time Revenue", f"₵{all_revenue:.2f}",   COLORS["gold"]),
+            (f"📅  {month_label} Revenue", f"₵{month_revenue:.2f}", COLORS["gold"]),
+            ("🏆  All-time Revenue", f"₵{all_revenue:.2f}",   COLORS["warning"]),
             ("🔥  Top Seller",       top_items[0][0] if top_items else "—",
              COLORS["accent"]),
         ]
@@ -4833,7 +5238,8 @@ class BlazeBiteApp(ctk.CTk):
         for row in self.root_cat_tree.get_children():
             self.root_cat_tree.delete(row)
 
-        store_map = {"All": None, "Fast Food": "fast_food", "Cold Store": "cold_store"}
+        store_map = {"All": None}
+        store_map.update(STORE_KEYS)
         selected_store = store_map.get(
             self.root_cat_store_var.get() if hasattr(self, "root_cat_store_var") else "All",
             None,
@@ -4854,8 +5260,8 @@ class BlazeBiteApp(ctk.CTk):
         ctk.CTkLabel(dialog, text="Store:",
                      font=ctk.CTkFont("Helvetica", 12, "bold"),
                      text_color=COLORS["text_primary"]).pack(pady=(16, 4))
-        store_var = tk.StringVar(value="Fast Food")
-        ctk.CTkComboBox(dialog, values=["Fast Food", "Cold Store"],
+        store_var = tk.StringVar(value=list(STORE_LABELS.values())[0])
+        ctk.CTkComboBox(dialog, values=list(STORE_LABELS.values()),
                         variable=store_var, width=250,
                         fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
                         text_color=COLORS["text_primary"],
@@ -4881,7 +5287,7 @@ class BlazeBiteApp(ctk.CTk):
 
         def save():
             store_label = store_var.get()
-            store_key = {"Fast Food": "fast_food", "Cold Store": "cold_store"}.get(store_label)
+            store_key = STORE_KEYS.get(store_label)
             name = name_entry.get().strip()
             if not name:
                 messagebox.showerror("Error", "Category name is required.")
@@ -4931,7 +5337,7 @@ class BlazeBiteApp(ctk.CTk):
         old_name = values[2]
         old_sort = values[3]
 
-        store_key = {"Fast Food": "fast_food", "Cold Store": "cold_store"}.get(old_store_label, old_store_label)
+        store_key = STORE_KEYS.get(old_store_label, old_store_label)
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Edit Category")
@@ -5015,7 +5421,7 @@ class BlazeBiteApp(ctk.CTk):
         values = self.root_cat_tree.item(selected[0], "values")
         cat_name = values[2]
         store_label = values[1]
-        store_key = {"Fast Food": "fast_food", "Cold Store": "cold_store"}.get(store_label, store_label)
+        store_key = STORE_KEYS.get(store_label, store_label)
 
         # Check if products exist in this category
         products = self.db.get_all_products(store=store_key, include_archived=True)
@@ -5042,6 +5448,113 @@ class BlazeBiteApp(ctk.CTk):
         if self.active_store == store_key:
             self.menu_data = self._load_menu()
             self._refresh_category_buttons()
+
+    def _bulk_upload_products(self):
+        """Bulk upload products from a CSV or JSON file."""
+        from tkinter import filedialog
+        filepath = filedialog.askopenfilename(
+            title="Select CSV or JSON file for bulk upload",
+            filetypes=[("CSV files", "*.csv"), ("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            ext = os.path.splitext(filepath)[1].lower()
+            products = []
+
+            if ext == ".csv":
+                with open(filepath, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        products.append({
+                            "store": row.get("store", "").strip(),
+                            "category": row.get("category", "").strip(),
+                            "name": row.get("name", "").strip(),
+                            "price": row.get("price", "0").strip(),
+                            "description": row.get("description", "").strip(),
+                            "quantity": row.get("quantity", "0").strip(),
+                            "barcode": row.get("barcode", "").strip(),
+                        })
+            elif ext == ".json":
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data = data.get("products", data.get("items", [data]))
+                if not isinstance(data, list):
+                    data = [data]
+                for item in data:
+                    products.append({
+                        "store": str(item.get("store", "")).strip(),
+                        "category": str(item.get("category", "")).strip(),
+                        "name": str(item.get("name", "")).strip(),
+                        "price": str(item.get("price", "0")).strip(),
+                        "description": str(item.get("description", "")).strip(),
+                        "quantity": str(item.get("quantity", "0")).strip(),
+                        "barcode": str(item.get("barcode", "")).strip(),
+                    })
+            else:
+                messagebox.showerror("Unsupported File", "Please select a .csv or .json file.")
+                return
+
+            if not products:
+                messagebox.showwarning("Empty File", "No products found in the file.")
+                return
+
+            # Validate and insert
+            valid_stores = set(STORE_LABELS.keys()) | set(STORE_LABELS.values())
+            added = 0
+            errors = []
+            for i, p in enumerate(products, start=1):
+                if not p["name"] or not p["category"]:
+                    errors.append(f"Row {i}: missing name or category")
+                    continue
+                try:
+                    price = float(p["price"])
+                except ValueError:
+                    errors.append(f"Row {i} '{p['name']}': invalid price '{p['price']}'")
+                    continue
+                try:
+                    qty = int(float(p["quantity"])) if p["quantity"] else 0
+                except ValueError:
+                    qty = 0
+
+                store_key = p["store"]
+                if store_key in STORE_LABELS:
+                    pass  # already a key
+                elif store_key in STORE_KEYS:
+                    store_key = STORE_KEYS[store_key]  # convert label to key
+                else:
+                    errors.append(f"Row {i} '{p['name']}': unknown store '{p['store']}'")
+                    continue
+
+                self.db.add_product(
+                    category=p["category"],
+                    name=p["name"],
+                    price=price,
+                    desc=p["description"],
+                    quantity=qty,
+                    store=store_key,
+                    barcode=p["barcode"],
+                )
+                added += 1
+
+            # Refresh views
+            self.menu_data = self._load_menu()
+            if hasattr(self, "root_items_tree"):
+                self._populate_system_items_tree(self.root_items_tree, self.root_items_store_var.get())
+            if hasattr(self, "prod_scroll"):
+                self._refresh_product_management()
+
+            msg = f"Successfully added {added} product(s)."
+            if errors:
+                msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors[:20])
+                if len(errors) > 20:
+                    msg += f"\n... and {len(errors) - 20} more"
+            messagebox.showinfo("Bulk Upload Complete", msg)
+
+        except Exception as e:
+            messagebox.showerror("Bulk Upload Error", f"Failed to process file:\n{e}")
 
     def _set_selected_system_item_archive(self, tree_widget, archive: bool):
         if self.current_role not in ("admin", "root_admin"):
@@ -5073,10 +5586,10 @@ class BlazeBiteApp(ctk.CTk):
         self.db.set_product_archived(item_id, archive)
         self.menu_data = self._load_menu()
 
-        store_key = {
-            "Fast Food": "fast_food",
-            "Cold Store": "cold_store",
-        }.get(store_display, store_display.lower() if isinstance(store_display, str) else "system")
+        store_key = STORE_KEYS.get(
+            store_display,
+            store_display.lower() if isinstance(store_display, str) else "system",
+        )
 
         self.db.log_activity(
             self.current_user or "unknown",
@@ -5100,11 +5613,8 @@ class BlazeBiteApp(ctk.CTk):
         for row in tree_widget.get_children():
             tree_widget.delete(row)
 
-        store_map = {
-            "All": None,
-            "Fast Food": "fast_food",
-            "Cold Store": "cold_store",
-        }
+        store_map = {"All": None}
+        store_map.update(STORE_KEYS)
         selected_store = store_map.get(store_filter, None)
 
         for row in self.db.get_all_products(store=selected_store, include_archived=True):
@@ -5247,6 +5757,15 @@ class BlazeBiteApp(ctk.CTk):
             command=self._run_item_report,
         ).pack(side="left")
 
+        ctk.CTkButton(
+            row1, text="📄 Save PDF",
+            height=34, width=120, corner_radius=8,
+            fg_color=COLORS["success"], hover_color="#059669",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 12, "bold"),
+            command=self._export_item_report_pdf,
+        ).pack(side="left", padx=(8, 0))
+
         # ── Row 1b: Custom date-range picker (hidden until "Custom" is selected) ──
         self._report_date_row = ctk.CTkFrame(inner, fg_color=COLORS["bg_panel"],
                                               corner_radius=8, border_width=1,
@@ -5357,9 +5876,9 @@ class BlazeBiteApp(ctk.CTk):
         else:
             # admin and attendant see only their own store's items
             names = sorted({row[2] for row in self.db.get_all_products(store=self.active_store)})
-        self.report_item_combo.configure(values=names if names else ["(no transactions yet)"])
-        if names and not self.report_item_var.get():
-            self.report_item_var.set(names[0])
+        self.report_item_combo.configure(values=["All Items"] + names if names else ["(no transactions yet)"])
+        if not self.report_item_var.get():
+            self.report_item_var.set("All Items")
 
     def _run_item_report(self):
         """Query the DB and populate the report results panel."""
@@ -5483,6 +6002,84 @@ class BlazeBiteApp(ctk.CTk):
             )
             if qty > 0:
                 self.report_tree.insert("", "end", values=(label, qty, f"{rev:,.2f}"))
+
+    def _export_item_report_pdf(self):
+        """Save the current Item Sales Report as a PDF file."""
+        from tkinter import filedialog
+
+        # Check if a report has been generated
+        if not hasattr(self, "report_tree") or not self.report_tree.get_children():
+            messagebox.showwarning("No Report", "Please generate a report first before saving as PDF.")
+            return
+
+        item_name = self.report_item_var.get().strip()
+        period = self.report_period_var.get()
+        total_qty = self.report_qty_lbl.cget("text")
+        total_rev = self.report_rev_lbl.cget("text")
+        date_range = self.report_range_lbl.cget("text")
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save Item Sales Report as PDF",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+            initialfile=f"Item_Report_{item_name.replace(' ', '_')}_{datetime.date.today().isoformat()}.pdf",
+        )
+        if not filepath:
+            return
+
+        try:
+            from reportlab.pdfgen import canvas as rl_canvas
+            from reportlab.lib.pagesizes import A4
+
+            c = rl_canvas.Canvas(filepath, pagesize=A4)
+            w, h = A4
+            y = h - 50
+
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(40, y, "Item Sales Report")
+            y -= 26
+
+            c.setFont("Helvetica", 11)
+            c.drawString(40, y, f"Item: {item_name}")
+            y -= 18
+            c.drawString(40, y, f"Period: {period}    |    Date Range: {date_range}")
+            y -= 18
+            c.drawString(40, y, f"Total Units Sold: {total_qty}    |    Total Revenue: {total_rev}")
+            y -= 30
+
+            # Table header
+            c.setFont("Helvetica-Bold", 11)
+            c.drawString(40, y, "Period")
+            c.drawString(280, y, "Units Sold")
+            c.drawString(420, y, "Revenue (\u20b5)")
+            y -= 4
+            c.line(40, y, w - 40, y)
+            y -= 16
+
+            c.setFont("Helvetica", 10)
+            for row_id in self.report_tree.get_children():
+                vals = self.report_tree.item(row_id, "values")
+                if y < 60:
+                    c.showPage()
+                    y = h - 50
+                    c.setFont("Helvetica", 10)
+                c.drawString(40, y, str(vals[0]))
+                c.drawString(300, y, str(vals[1]))
+                c.drawString(430, y, str(vals[2]))
+                y -= 16
+
+            y -= 10
+            c.line(40, y, w - 40, y)
+            y -= 16
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(40, y, "TOTAL")
+            c.drawString(300, y, str(total_qty))
+            c.drawString(430, y, str(total_rev))
+
+            c.save()
+            messagebox.showinfo("PDF Saved", f"Report saved to:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("PDF Error", f"Failed to save PDF:\n{e}")
 
     def _build_product_management(self, parent):
         # Search bar (outside scroll so it stays pinned at top)
