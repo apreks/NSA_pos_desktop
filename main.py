@@ -42,6 +42,15 @@ def get_app_data_dir():
 # ─────────────────────────────────────────────
 APP_NAME = "NSA POINT OF SALE"
 DEFAULT_TAX_RATE = 0.15  # 15% tax – overridden by admin setting
+
+# ─────────────────────────────────────────────
+#  GHANA GRA TAX LEVIES (restaurants)
+# ─────────────────────────────────────────────
+GRA_TAX_LEVIES = [
+    {"key": "vat",     "label": "VAT",           "rate": 0.15,  "default_enabled": True},
+    {"key": "nhil",    "label": "NHIL",          "rate": 0.025, "default_enabled": True},
+    {"key": "getfund", "label": "GETFund Levy",  "rate": 0.025, "default_enabled": True},
+]
 DB_FILE = os.path.join(get_app_data_dir(), "blazebite.db")
 SETTINGS_FILE = os.path.join(get_app_data_dir(), "settings.json")
 ADMIN_PASSWORD = "admin123"
@@ -1153,6 +1162,9 @@ class BlazeBiteApp(ctk.CTk):
         self.resizable(True, True)
         self.attributes("-alpha", 1.0)  # Ensure full opacity for better performance
 
+        # Start maximized
+        self.state("zoomed")
+
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
@@ -1169,6 +1181,11 @@ class BlazeBiteApp(ctk.CTk):
         self.active_category = None
         self.receipt_paper_profile = "Auto"  # Auto | 80mm | 58mm
         self.tax_rate = DEFAULT_TAX_RATE
+        # GRA tax levies state: {key: {"label", "rate", "enabled"}}
+        self.gra_taxes = {
+            t["key"]: {"label": t["label"], "rate": t["rate"], "enabled": t["default_enabled"]}
+            for t in GRA_TAX_LEVIES
+        }
         self._load_app_settings()
 
         # ── Cloud sync (local-first, sync on demand) ──
@@ -1199,7 +1216,7 @@ class BlazeBiteApp(ctk.CTk):
             profile = str(data.get("receipt_paper_profile", "Auto")).strip()
             if profile in ("Auto", "80mm", "58mm"):
                 self.receipt_paper_profile = profile
-            # Tax rate
+            # Tax rate (legacy single-rate)
             saved_tax = data.get("tax_rate")
             if saved_tax is not None:
                 try:
@@ -1208,6 +1225,22 @@ class BlazeBiteApp(ctk.CTk):
                         self.tax_rate = val
                 except (ValueError, TypeError):
                     pass
+            # GRA tax levies
+            saved_gra = data.get("gra_taxes")
+            if isinstance(saved_gra, dict):
+                for key, info in self.gra_taxes.items():
+                    if key in saved_gra:
+                        entry = saved_gra[key]
+                        if isinstance(entry, dict):
+                            if "enabled" in entry:
+                                info["enabled"] = bool(entry["enabled"])
+                            if "rate" in entry:
+                                try:
+                                    r = float(entry["rate"])
+                                    if 0.0 <= r <= 1.0:
+                                        info["rate"] = r
+                                except (ValueError, TypeError):
+                                    pass
         except Exception:
             # Keep defaults when settings are missing/corrupt.
             self.receipt_paper_profile = "Auto"
@@ -1219,11 +1252,42 @@ class BlazeBiteApp(ctk.CTk):
             data = {
                 "receipt_paper_profile": self.receipt_paper_profile,
                 "tax_rate": self.tax_rate,
+                "gra_taxes": {
+                    key: {"rate": info["rate"], "enabled": info["enabled"]}
+                    for key, info in self.gra_taxes.items()
+                },
             }
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
+
+    def _calc_gra_taxes(self, total_incl: float) -> list[dict]:
+        """Extract inclusive GRA levies from a tax-inclusive total.
+
+        Ghana GRA taxes are already included in the selling price.
+        This extracts each levy's portion from the total.
+        Returns list of {'key', 'label', 'rate', 'amount'}.
+        """
+        enabled = [(k, i) for k, i in self.gra_taxes.items() if i["enabled"]]
+        if not enabled:
+            return []
+        combined_rate = sum(i["rate"] for _, i in enabled)
+        base = total_incl / (1 + combined_rate)  # price before tax
+        breakdown = []
+        for key, info in enabled:
+            amount = round(base * info["rate"], 2)
+            breakdown.append({
+                "key": key,
+                "label": info["label"],
+                "rate": info["rate"],
+                "amount": amount,
+            })
+        return breakdown
+
+    def _total_gra_tax(self, total_incl: float) -> float:
+        """Return total inclusive GRA tax extracted from a tax-inclusive total."""
+        return sum(t["amount"] for t in self._calc_gra_taxes(total_incl))
 
     def _on_app_close(self):
         """Handle window close – auto-backup if enabled, then exit."""
@@ -1250,7 +1314,7 @@ class BlazeBiteApp(ctk.CTk):
         self._save_app_settings()
 
     def _on_tax_rate_changed(self):
-        """Apply admin-entered tax rate and update UI."""
+        """Apply admin-entered fallback tax rate and update UI."""
         raw = self._admin_tax_var.get().strip().replace("%", "")
         try:
             pct = float(raw)
@@ -1266,20 +1330,27 @@ class BlazeBiteApp(ctk.CTk):
         self.tax_rate = round(pct / 100.0, 4)
         self._save_app_settings()
 
-        # Update the order panel tax label
-        if hasattr(self, "tax_lbl"):
-            # Find the label text widget on the left side of the tax row
-            parent_row = self.tax_lbl.master
-            for child in parent_row.winfo_children():
-                if child is not self.tax_lbl:
-                    child.configure(text=f"Tax ({pct:.0f}%)")
-                    break
-
-        # Refresh totals so the new rate takes effect immediately
         self._refresh_order_panel()
 
         self._admin_tax_status.configure(
-            text=f"Current: {pct:.1f}%", text_color=COLORS["text_muted"])
+            text=f"Fallback: {pct:.1f}%", text_color=COLORS["text_muted"])
+
+    def _on_gra_tax_toggled(self, key: str, switch_var):
+        """Handle toggling a GRA tax levy on/off."""
+        self.gra_taxes[key]["enabled"] = switch_var.get()
+        self._save_app_settings()
+        self._refresh_order_panel()
+        if hasattr(self, "_gra_tax_total_lbl"):
+            self._gra_tax_total_lbl.configure(text=self._gra_tax_summary_text())
+
+    def _gra_tax_summary_text(self) -> str:
+        """Return a summary string of enabled GRA levies and total rate."""
+        enabled = [info for info in self.gra_taxes.values() if info["enabled"]]
+        if not enabled:
+            return "No GRA levies active  —  no tax applied"
+        total_pct = sum(info["rate"] for info in enabled) * 100
+        parts = [f"{info['label']} {info['rate']*100:.1f}%" for info in enabled]
+        return f"Inclusive: {' + '.join(parts)}  =  {total_pct:.1f}% (already in prices)"
 
     def _build_layout(self):
         # Top bar
@@ -2102,29 +2173,52 @@ class BlazeBiteApp(ctk.CTk):
                                     corner_radius=0, border_width=1,
                                     border_color=COLORS["border"])
         totals_frame.pack(fill="x", padx=0, pady=(1, 0))
+        self._totals_frame = totals_frame
 
-        for label_attr, val_attr, color in [
-            ("Subtotal",  "sub_lbl",   COLORS["text_secondary"]),
-            (f"Tax ({self.tax_rate*100:.0f}%)", "tax_lbl",   COLORS["text_secondary"]),
-            ("TOTAL",     "total_lbl", COLORS["accent_glow"]),
-        ]:
-            row = ctk.CTkFrame(totals_frame, fg_color="transparent")
-            row.pack(fill="x", padx=18, pady=5)
-            ctk.CTkLabel(row, text=label_attr,
-                         font=ctk.CTkFont("Helvetica", 13,
-                                          "bold" if label_attr == "TOTAL" else "normal"),
-                         text_color=color).pack(side="left")
-            lbl = ctk.CTkLabel(row, text="₵0.00",
-                               font=ctk.CTkFont("Helvetica", 14 if label_attr == "TOTAL" else 13, "bold"),
-                               text_color=color)
-            lbl.pack(side="right")
-            setattr(self, val_attr, lbl)
+        # Subtotal row
+        row = ctk.CTkFrame(totals_frame, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=5)
+        ctk.CTkLabel(row, text="Subtotal",
+                     font=ctk.CTkFont("Helvetica", 13),
+                     text_color=COLORS["text_secondary"]).pack(side="left")
+        self.sub_lbl = ctk.CTkLabel(row, text="₵0.00",
+                                    font=ctk.CTkFont("Helvetica", 13, "bold"),
+                                    text_color=COLORS["text_secondary"])
+        self.sub_lbl.pack(side="right")
+
+        # GRA tax breakdown rows (dynamic)
+        self._tax_breakdown_frame = ctk.CTkFrame(totals_frame, fg_color="transparent")
+        self._tax_breakdown_frame.pack(fill="x")
+        self._tax_breakdown_labels = []  # list of (label_widget, value_widget)
+
+        # Combined tax row (legacy / total)
+        tax_row = ctk.CTkFrame(totals_frame, fg_color="transparent")
+        tax_row.pack(fill="x", padx=18, pady=2)
+        self._tax_label_widget = ctk.CTkLabel(tax_row, text="Tax",
+                                              font=ctk.CTkFont("Helvetica", 12),
+                                              text_color=COLORS["text_muted"])
+        self._tax_label_widget.pack(side="left")
+        self.tax_lbl = ctk.CTkLabel(tax_row, text="₵0.00",
+                                    font=ctk.CTkFont("Helvetica", 12, "bold"),
+                                    text_color=COLORS["text_muted"])
+        self.tax_lbl.pack(side="right")
+
+        # Total row
+        row = ctk.CTkFrame(totals_frame, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=5)
+        ctk.CTkLabel(row, text="TOTAL",
+                     font=ctk.CTkFont("Helvetica", 13, "bold"),
+                     text_color=COLORS["accent_glow"]).pack(side="left")
+        self.total_lbl = ctk.CTkLabel(row, text="₵0.00",
+                                      font=ctk.CTkFont("Helvetica", 14, "bold"),
+                                      text_color=COLORS["accent_glow"])
+        self.total_lbl.pack(side="right")
 
         # Client / Receiver name
         client_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg_panel"], corner_radius=0,
                                     border_width=1, border_color=COLORS["border"])
         client_frame.pack(fill="x", padx=0, pady=(1, 0))
-        ctk.CTkLabel(client_frame, text="Client/Receiver:",
+        ctk.CTkLabel(client_frame, text="Customer:",
                      font=ctk.CTkFont("Helvetica", 13, "bold"),
                      text_color=COLORS["text_primary"]).pack(side="left", padx=(18, 10), pady=12)
         self.client_name_var = ctk.StringVar(value="")
@@ -2136,7 +2230,7 @@ class BlazeBiteApp(ctk.CTk):
             fg_color=COLORS["bg_card"],
             border_color=COLORS["border"],
             text_color=COLORS["text_primary"],
-            placeholder_text="Enter client/receiver name (optional)",
+            placeholder_text="Enter customer name (optional)",
             font=ctk.CTkFont("Helvetica", 11),
         )
         self.client_name_entry.pack(side="left", padx=(0, 12), pady=10, fill="x", expand=True)
@@ -2263,12 +2357,42 @@ class BlazeBiteApp(ctk.CTk):
             for name, data in self.order_items.items():
                 self._make_order_row(name, data)
 
-        # Recalculate totals
-        subtotal = sum(d["price"] * d["qty"] for d in self.order_items.values())
-        tax      = subtotal * self.tax_rate
-        total    = subtotal + tax
+        # Recalculate totals — GRA taxes are INCLUSIVE (already in selling price)
+        total = sum(d["price"] * d["qty"] for d in self.order_items.values())
+        gra_breakdown = self._calc_gra_taxes(total)
+
+        if gra_breakdown:
+            tax = sum(t["amount"] for t in gra_breakdown)
+            subtotal = round(total - tax, 2)
+        else:
+            tax = 0.0
+            subtotal = total
 
         self.sub_lbl.configure(text=f"₵{subtotal:.2f}")
+
+        # Update GRA breakdown rows
+        for w in self._tax_breakdown_frame.winfo_children():
+            w.destroy()
+        self._tax_breakdown_labels.clear()
+
+        if gra_breakdown:
+            for t in gra_breakdown:
+                row = ctk.CTkFrame(self._tax_breakdown_frame, fg_color="transparent")
+                row.pack(fill="x", padx=18, pady=1)
+                lbl = ctk.CTkLabel(row, text=f"{t['label']} ({t['rate']*100:.1f}%)",
+                                   font=ctk.CTkFont("Helvetica", 11),
+                                   text_color=COLORS["text_muted"])
+                lbl.pack(side="left")
+                val = ctk.CTkLabel(row, text=f"₵{t['amount']:.2f}",
+                                   font=ctk.CTkFont("Helvetica", 11),
+                                   text_color=COLORS["text_muted"])
+                val.pack(side="right")
+                self._tax_breakdown_labels.append((lbl, val))
+            total_pct = sum(t["rate"] for t in gra_breakdown) * 100
+            self._tax_label_widget.configure(text=f"Incl. Tax ({total_pct:.1f}%)")
+        else:
+            self._tax_label_widget.configure(text="Tax (incl.)")
+
         self.tax_lbl.configure(text=f"₵{tax:.2f}")
         self.total_lbl.configure(text=f"₵{total:.2f}")
         self._update_change_display()
@@ -2301,9 +2425,8 @@ class BlazeBiteApp(ctk.CTk):
             self.change_lbl.configure(text="Change: N/A (non-cash)", text_color=COLORS["text_muted"])
             return
 
-        subtotal = sum(d["price"] * d["qty"] for d in self.order_items.values())
-        tax = subtotal * self.tax_rate
-        total = subtotal + tax
+        # Taxes are inclusive — total is just the sum of item prices
+        total = sum(d["price"] * d["qty"] for d in self.order_items.values())
         cash_tendered = self._parse_cash_tendered()
 
         if cash_tendered is None:
@@ -2371,9 +2494,13 @@ class BlazeBiteApp(ctk.CTk):
             messagebox.showwarning("Empty Order", "Please add items before checking out.")
             return
 
-        subtotal = sum(d["price"] * d["qty"] for d in self.order_items.values())
-        tax      = subtotal * self.tax_rate
-        total    = subtotal + tax
+        total = sum(d["price"] * d["qty"] for d in self.order_items.values())
+        gra_breakdown = self._calc_gra_taxes(total)
+        if gra_breakdown:
+            tax = sum(t["amount"] for t in gra_breakdown)
+        else:
+            tax = 0.0
+        subtotal = round(total - tax, 2)
         payment  = self.payment_var.get()
         cash_tendered = None
         change = None
@@ -2424,6 +2551,7 @@ class BlazeBiteApp(ctk.CTk):
             "store": STORE_LABELS.get(self.active_store, self.active_store or "—"),
             "timestamp": datetime.datetime.now(),
             "client_name": client_name,
+            "tax_breakdown": gra_breakdown,
         }
         invoice = self._build_invoice(order_data)
 
@@ -2686,13 +2814,17 @@ class BlazeBiteApp(ctk.CTk):
         lines.append(MID)
 
         # ── Summary ──
-        lines.append(lr(f"Items: {total_qty}", f"Subtotal: {fm(subtotal)}", W))
-        tax_pct = self.tax_rate * 100
-        if tax_pct > 0:
-            lines.append(lr("", f"Tax ({tax_pct:.0f}%): {fm(tax)}", W))
+        lines.append(lr(f"Items: {total_qty}", "", W))
         lines.append(SEP)
         lines.append(lr("TOTAL:", fm(total), W))
         lines.append(SEP)
+        tax_breakdown = order_data.get("tax_breakdown") or []
+        if tax_breakdown:
+            lines.append(lr("Tax included in prices:", "", W))
+            for t in tax_breakdown:
+                lines.append(lr(f"  {t['label']} ({t['rate']*100:.1f}%)", fm(t["amount"]), W))
+            lines.append(lr("  Total Tax:", fm(tax), W))
+            lines.append(MID)
 
         # ── Payment ──
         lines.append(lr("Payment:", payment, W))
@@ -2842,10 +2974,7 @@ class BlazeBiteApp(ctk.CTk):
         left_mid()
 
         # ── Summary ──
-        lr(f"Items: {total_qty}", f"Subtotal: {fm(subtotal)}")
-        tax_pct = self.tax_rate * 100
-        if tax_pct > 0:
-            lr("", f"Tax ({tax_pct:.0f}%): {fm(tax)}")
+        lr(f"Items: {total_qty}", "")
         left_sep()
 
         # ── TOTAL (bold + double-height for emphasis) ──
@@ -2855,6 +2984,15 @@ class BlazeBiteApp(ctk.CTk):
         _set_double(h=False)
         _set_bold(False)
         left_sep()
+
+        # ── Inclusive tax breakdown ──
+        tax_breakdown = order_data.get("tax_breakdown") or []
+        if tax_breakdown:
+            left("Tax included in prices:")
+            for t in tax_breakdown:
+                lr(f"  {t['label']} ({t['rate']*100:.1f}%)", fm(t["amount"]))
+            lr("  Total Tax:", fm(tax))
+            left_mid()
 
         # ── Payment ──
         lr("Payment:", payment)
@@ -3085,12 +3223,7 @@ class BlazeBiteApp(ctk.CTk):
 
             # ── Summary ──
             p.set(align='left', bold=False, width=1, height=1)
-            p.textln(self._left_right(
-                f"Items: {total_qty}", f"Subtotal: {fm(subtotal)}", W))
-            tax_pct = self.tax_rate * 100
-            if tax_pct > 0:
-                p.textln(self._left_right(
-                    "", f"Tax ({tax_pct:.0f}%): {fm(tax)}", W))
+            p.textln(self._left_right(f"Items: {total_qty}", "", W))
             p.textln(SEP)
 
             # ── TOTAL (bold + double-height) ──
@@ -3099,6 +3232,16 @@ class BlazeBiteApp(ctk.CTk):
 
             p.set(align='left', bold=False, width=1, height=1)
             p.textln(SEP)
+
+            # ── Inclusive tax breakdown ──
+            tax_breakdown = order_data.get("tax_breakdown") or []
+            if tax_breakdown:
+                p.textln("Tax included in prices:")
+                for t in tax_breakdown:
+                    p.textln(self._left_right(
+                        f"  {t['label']} ({t['rate']*100:.1f}%)", fm(t["amount"]), W))
+                p.textln(self._left_right("  Total Tax:", fm(tax), W))
+                p.textln(MID)
 
             # ── Payment ──
             p.textln(self._left_right("Payment:", payment, W))
@@ -3165,6 +3308,7 @@ class BlazeBiteApp(ctk.CTk):
             "store": STORE_LABELS.get(store_key, store_key or "—"),
             "timestamp": ts,
             "client_name": client_name or "",
+            "tax_breakdown": self._calc_gra_taxes(subtotal) if self._calc_gra_taxes(subtotal) else [],
         }
         invoice = self._build_invoice(order_data)
         self._show_invoice_window(invoice, order_data)
@@ -3685,45 +3829,88 @@ class BlazeBiteApp(ctk.CTk):
             command=self._admin_delete_category,
         ).pack(side="left")
 
-        # ─── Tax Rate Setting ───
+        # ─── Ghana GRA Tax Levies ───
         tax_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
                                  corner_radius=10, border_width=1,
                                  border_color=COLORS["border"])
         tax_frame.pack(fill="x", padx=16, pady=(0, 12))
 
-        ctk.CTkLabel(tax_frame, text="💰  Tax Rate",
+        ctk.CTkLabel(tax_frame, text="🇬🇭  Ghana GRA Tax Levies",
                      font=ctk.CTkFont("Helvetica", 14, "bold"),
                      text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 4))
 
-        tax_row = ctk.CTkFrame(tax_frame, fg_color="transparent")
-        tax_row.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkLabel(tax_frame, text="Toggle individual levies on/off. Rates apply to subtotal and appear on receipts.",
+                     font=ctk.CTkFont("Helvetica", 10),
+                     text_color=COLORS["text_muted"]).pack(anchor="w", padx=12, pady=(0, 6))
 
-        ctk.CTkLabel(tax_row, text="Rate (%):",
-                     font=ctk.CTkFont("Helvetica", 11, "bold"),
-                     text_color=COLORS["text_secondary"]).pack(side="left", padx=(0, 8))
+        self._gra_tax_switches = {}
+        for key, info in self.gra_taxes.items():
+            levy_row = ctk.CTkFrame(tax_frame, fg_color="transparent")
+            levy_row.pack(fill="x", padx=12, pady=3)
+
+            switch_var = tk.BooleanVar(value=info["enabled"])
+            switch = ctk.CTkSwitch(
+                levy_row, text="",
+                variable=switch_var,
+                onvalue=True, offvalue=False,
+                width=44, height=22,
+                fg_color=COLORS["border"],
+                progress_color=COLORS["success"],
+                command=lambda k=key, sv=switch_var: self._on_gra_tax_toggled(k, sv),
+            )
+            switch.pack(side="left", padx=(0, 8))
+
+            ctk.CTkLabel(
+                levy_row,
+                text=f"{info['label']}  —  {info['rate'] * 100:.1f}%",
+                font=ctk.CTkFont("Helvetica", 12, "bold"),
+                text_color=COLORS["text_primary"],
+            ).pack(side="left")
+
+            self._gra_tax_switches[key] = switch_var
+
+        # Total effective rate display
+        tax_summary_row = ctk.CTkFrame(tax_frame, fg_color="transparent")
+        tax_summary_row.pack(fill="x", padx=12, pady=(6, 10))
+
+        self._gra_tax_total_lbl = ctk.CTkLabel(
+            tax_summary_row,
+            text=self._gra_tax_summary_text(),
+            font=ctk.CTkFont("Helvetica", 11, "bold"),
+            text_color=COLORS["accent"],
+        )
+        self._gra_tax_total_lbl.pack(side="left")
+
+        # Legacy overall tax rate (still respected if no GRA levies enabled)
+        legacy_tax_row = ctk.CTkFrame(tax_frame, fg_color="transparent")
+        legacy_tax_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkLabel(legacy_tax_row, text="Fallback rate (%):",
+                     font=ctk.CTkFont("Helvetica", 10),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(0, 8))
 
         self._admin_tax_var = tk.StringVar(value=f"{self.tax_rate * 100:.1f}")
         self._admin_tax_entry = ctk.CTkEntry(
-            tax_row, textvariable=self._admin_tax_var,
-            width=80, height=32, corner_radius=8,
+            legacy_tax_row, textvariable=self._admin_tax_var,
+            width=60, height=28, corner_radius=8,
             fg_color=COLORS["bg_hover"], border_color=COLORS["border"],
             text_color=COLORS["text_primary"],
-            font=ctk.CTkFont("Helvetica", 12),
+            font=ctk.CTkFont("Helvetica", 11),
         )
-        self._admin_tax_entry.pack(side="left", padx=(0, 8))
+        self._admin_tax_entry.pack(side="left", padx=(0, 6))
 
         ctk.CTkButton(
-            tax_row, text="Apply", width=80, height=32, corner_radius=8,
-            fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
-            text_color="white", font=ctk.CTkFont("Helvetica", 11, "bold"),
+            legacy_tax_row, text="Apply", width=60, height=28, corner_radius=8,
+            fg_color=COLORS["border"], hover_color="#4B5563",
+            text_color="white", font=ctk.CTkFont("Helvetica", 10, "bold"),
             command=self._on_tax_rate_changed,
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
 
         self._admin_tax_status = ctk.CTkLabel(
-            tax_row, text=f"Current: {self.tax_rate * 100:.1f}%",
-            font=ctk.CTkFont("Helvetica", 10),
+            legacy_tax_row, text=f"Used when all GRA levies are off",
+            font=ctk.CTkFont("Helvetica", 9),
             text_color=COLORS["text_muted"])
-        self._admin_tax_status.pack(side="left", padx=(8, 0))
+        self._admin_tax_status.pack(side="left", padx=(6, 0))
 
         # Receipt printer settings
         receipt_frame = ctk.CTkFrame(admin_scroll, fg_color=COLORS["bg_card"],
@@ -4089,6 +4276,17 @@ class BlazeBiteApp(ctk.CTk):
             text_color="#0A0E27",
             font=ctk.CTkFont("Helvetica", 10, "bold"),
             command=self._bulk_upload_products,
+        ).pack(side="left", padx=(6, 0))
+
+        ctk.CTkButton(
+            root_item_actions,
+            text="📄 Download Template",
+            height=30,
+            fg_color=COLORS["border"],
+            hover_color="#4B5563",
+            text_color="white",
+            font=ctk.CTkFont("Helvetica", 10, "bold"),
+            command=self._download_bulk_upload_template,
         ).pack(side="left", padx=(6, 0))
 
         # ─── Category Management ──────────────────────────────
@@ -5449,6 +5647,39 @@ class BlazeBiteApp(ctk.CTk):
             self.menu_data = self._load_menu()
             self._refresh_category_buttons()
 
+    def _download_bulk_upload_template(self):
+        """Save a CSV template file for bulk product uploads."""
+        from tkinter import filedialog
+        filepath = filedialog.asksaveasfilename(
+            title="Save Bulk Upload Template",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile="bulk_upload_template.csv",
+        )
+        if not filepath:
+            return
+
+        try:
+            store_options = " | ".join(STORE_LABELS.values())
+            headers = ["store", "category", "name", "price", "description", "quantity", "barcode"]
+            sample_rows = [
+                ["NSA Fast Food", "Burgers", "Classic Burger", "5.99", "Beef patty with lettuce and tomato", "50", "1234567890123"],
+                ["NSA Papao/Frozen Foods", "Frozen Meals", "Frozen Pizza", "8.49", "Pepperoni frozen pizza", "30", "9876543210987"],
+            ]
+
+            with open(filepath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                # Instruction row as a comment
+                writer.writerow([f"# Instructions: Fill in product details below. Valid stores: {store_options}"])
+                writer.writerow([f"# Required fields: store, category, name, price. Optional: description, quantity, barcode"])
+                writer.writerow(headers)
+                for row in sample_rows:
+                    writer.writerow(row)
+
+            messagebox.showinfo("Template Saved", f"Bulk upload template saved to:\n{filepath}\n\nEdit the file, remove the sample rows, and add your products.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save template:\n{e}")
+
     def _bulk_upload_products(self):
         """Bulk upload products from a CSV or JSON file."""
         from tkinter import filedialog
@@ -5465,8 +5696,11 @@ class BlazeBiteApp(ctk.CTk):
 
             if ext == ".csv":
                 with open(filepath, "r", encoding="utf-8-sig") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
+                    # Skip comment lines starting with #
+                    lines = [line for line in f if not line.lstrip().startswith("#")]
+                import io
+                reader = csv.DictReader(io.StringIO("".join(lines)))
+                for row in reader:
                         products.append({
                             "store": row.get("store", "").strip(),
                             "category": row.get("category", "").strip(),
@@ -6898,6 +7132,8 @@ class BlazeBiteApp(ctk.CTk):
             else:
                 self._show_view("pos")
             dialog.destroy()
+            # Re-maximize after login dialog closes
+            self.after(50, lambda: self.state("zoomed"))
 
             # Check if user must change password on first login
             u_row = self.db.get_user_by_id(_user_id)
