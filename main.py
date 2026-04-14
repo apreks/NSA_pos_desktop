@@ -588,6 +588,32 @@ class Database:
         )
         return cur.fetchall()
 
+    def get_activity_logs_filtered(self, date_from: str = "", date_to: str = ""):
+        """Return activity logs optionally filtered by date range (YYYY-MM-DD)."""
+        if date_from and date_to:
+            cur = self.conn.execute(
+                """SELECT id, timestamp, actor_username, actor_role, action, target, details, store
+                   FROM activities
+                   WHERE substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ?
+                   ORDER BY id DESC""",
+                (date_from, date_to),
+            )
+        elif date_from:
+            cur = self.conn.execute(
+                """SELECT id, timestamp, actor_username, actor_role, action, target, details, store
+                   FROM activities
+                   WHERE substr(timestamp, 1, 10) = ?
+                   ORDER BY id DESC""",
+                (date_from,),
+            )
+        else:
+            cur = self.conn.execute(
+                """SELECT id, timestamp, actor_username, actor_role, action, target, details, store
+                   FROM activities
+                   ORDER BY id DESC""",
+            )
+        return cur.fetchall()
+
     def get_item_report(self, item_name: str, date_from: str, date_to: str,
                         store: str | None = None):
         """Return (total_qty, total_revenue) for a named item between two ISO dates.
@@ -839,27 +865,55 @@ BACKUP_DIR = os.path.join(get_app_data_dir(), "backups")
 SYNC_SETTINGS_FILE = os.path.join(get_app_data_dir(), "sync_settings.json")
 
 class CloudSync:
-    """Handles local backups and optional sync to a cloud-synced folder.
+    """Handles local backups with automatic cloud sync.
 
-    The cloud folder is simply a local directory that is synced by a
-    third-party service (OneDrive, Google Drive, Dropbox, etc.).
-    The app never makes internet calls itself.
+    The cloud folder is a local directory synced by a third-party service
+    (OneDrive, Google Drive, Dropbox, etc.).  Backups are always created
+    locally first, then automatically copied to the cloud folder when
+    available.  If the cloud folder is unreachable the local backup is
+    kept as a fallback.
     """
 
     def __init__(self, db: Database):
         self.db = db
         self._ensure_dirs()
         self.settings = self._load_settings()
+        # Auto-detect a cloud folder on first run if none is configured
+        if not self.settings.get("cloud_folder"):
+            detected = self._auto_detect_cloud_folder()
+            if detected:
+                self.settings["cloud_folder"] = detected
+                self.save_settings()
 
     @staticmethod
     def _ensure_dirs():
         os.makedirs(BACKUP_DIR, exist_ok=True)
 
     @staticmethod
+    def _auto_detect_cloud_folder() -> str:
+        """Try to find a common cloud-sync folder on this machine."""
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(home, "OneDrive"),
+            os.path.join(home, "OneDrive - Personal"),
+            os.path.join(home, "Google Drive"),
+            os.path.join(home, "Dropbox"),
+            os.path.join(home, "iCloudDrive"),
+        ]
+        # Also check ONEDRIVE env variable (set by Windows when signed in)
+        env_onedrive = os.environ.get("OneDrive") or os.environ.get("ONEDRIVE")
+        if env_onedrive:
+            candidates.insert(0, env_onedrive)
+        for path in candidates:
+            if os.path.isdir(path):
+                return path
+        return ""
+
+    @staticmethod
     def _load_settings() -> dict:
         defaults = {
             "cloud_folder": "",
-            "auto_backup_on_exit": False,
+            "auto_backup_on_exit": True,
             "last_backup": "",
             "last_cloud_sync": "",
         }
@@ -972,6 +1026,22 @@ class CloudSync:
                     shutil.copy2(os.path.join(cloud_backup_dir, fname), local_path)
                     imported.append(local_path)
         return imported
+
+    def smart_backup(self) -> tuple[str, str]:
+        """Create a backup and sync to cloud if possible.
+
+        Returns (local_path, cloud_path_or_empty).
+        Always succeeds with at least a local backup.
+        """
+        local_path = self.create_backup()
+        self.cleanup_old_backups(keep=10)
+        cloud_path = ""
+        if self.is_cloud_configured():
+            try:
+                cloud_path = self.sync_to_cloud()
+            except Exception:
+                pass  # Cloud unreachable – local backup is the fallback
+        return local_path, cloud_path
 
     def check_internet(self) -> bool:
         """Quick check whether the machine appears to have internet access.
@@ -1200,6 +1270,10 @@ class BlazeBiteApp(ctk.CTk):
         # Pre-warm printer cache in background (instant receipt window later)
         threading.Thread(target=self._prewarm_printer_cache, daemon=True).start()
 
+        # Silent background update check
+        from updater import check_for_updates
+        check_for_updates(self, is_transaction_active=False)
+
         # Show login immediately
         self._show_login()
 
@@ -1290,11 +1364,9 @@ class BlazeBiteApp(ctk.CTk):
         return sum(t["amount"] for t in self._calc_gra_taxes(total_incl))
 
     def _on_app_close(self):
-        """Handle window close – auto-backup if enabled, then exit."""
+        """Handle window close – always backup (cloud first, local fallback)."""
         try:
-            if self.cloud_sync.settings.get("auto_backup_on_exit", False):
-                self.cloud_sync.create_backup()
-                self.cloud_sync.cleanup_old_backups(keep=10)
+            self.cloud_sync.smart_backup()
         except Exception:
             pass
         self.destroy()
@@ -2556,14 +2628,29 @@ class BlazeBiteApp(ctk.CTk):
         invoice = self._build_invoice(order_data)
 
         # Show invoice window (pass order data for ESC/POS printing)
-        self._show_invoice_window(invoice, order_data)
+        # Defer cart clear until receipt is confirmed (print/save/close) – cancel keeps items
+        def _finalize_order():
+            self._clear_order()
+            self.order_counter += 1
+            self.order_badge.configure(text=f"Order  # {self.order_counter:04d}")
+            threading.Thread(target=self._background_backup, daemon=True).start()
 
-        # Reset
-        self._clear_order()
-        self.order_counter += 1
-        self.order_badge.configure(text=f"Order  # {self.order_counter:04d}")
+        self._show_invoice_window(invoice, order_data, on_complete=_finalize_order)
 
     _printer_cache: dict = {}   # {"name": ..., "list": ..., "ts": float}
+    _last_backup_ts: float = 0.0  # monotonic timestamp of last backup
+
+    def _background_backup(self):
+        """Run smart_backup in background, throttled to once per 60 s."""
+        import time as _time
+        now = _time.monotonic()
+        if now - self._last_backup_ts < 60:
+            return  # Throttle – don't backup more than once a minute
+        self._last_backup_ts = now
+        try:
+            self.cloud_sync.smart_backup()
+        except Exception:
+            pass
 
     def _prewarm_printer_cache(self):
         """Pre-warm the printer cache in a background thread."""
@@ -3339,7 +3426,7 @@ class BlazeBiteApp(ctk.CTk):
             return
         self._reprint_receipt(tx_row)
 
-    def _show_invoice_window(self, invoice: str, order_data: dict | None = None):
+    def _show_invoice_window(self, invoice: str, order_data: dict | None = None, on_complete=None):
         # Use cached values instantly (pre-warmed at startup) – never block
         default_printer = self._printer_cache.get("name")
         all_printers = self._printer_cache.get("list", [])
@@ -3367,6 +3454,14 @@ class BlazeBiteApp(ctk.CTk):
         win.minsize(380, 400)
         win.configure(fg_color=COLORS["bg_dark"])
         win.grab_set()
+
+        # X button = same as cancel (keep cart items)
+        def _on_close():
+            win.destroy()
+            if on_complete is None:  # reprint path – no tab switch needed
+                return
+            self._switch_pos_tab("order")
+        win.protocol("WM_DELETE_WINDOW", _on_close)
 
         # ── Top banner ──
         ctk.CTkLabel(win, text="✅  Order Complete!",
@@ -3568,6 +3663,29 @@ class BlazeBiteApp(ctk.CTk):
                 f.write(invoice)
             status_var.set(f"Saved: {txt_path}")
 
+        _order_finalized = False
+
+        def _finalize_once():
+            nonlocal _order_finalized
+            if not _order_finalized and on_complete:
+                _order_finalized = True
+                on_complete()
+
+        def _confirm_and_print():
+            """Show confirmation dialog before printing."""
+            if messagebox.askyesno(
+                "Confirm Print",
+                "Are you sure you want to print this receipt?",
+                parent=win,
+            ):
+                _finalize_once()
+                _do_print()
+
+        def _cancel_receipt():
+            """Close receipt and navigate back to the cart/order tab (items kept)."""
+            win.destroy()
+            self._switch_pos_tab("order")
+
         # ── Button row ──
         btn_row = ctk.CTkFrame(win, fg_color="transparent")
         btn_row.pack(pady=(8, 16))
@@ -3576,13 +3694,13 @@ class BlazeBiteApp(ctk.CTk):
                       fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
                       text_color="#0A0E27", corner_radius=9,
                       font=ctk.CTkFont("Helvetica", 13, "bold"),
-                      command=_do_print).pack(side="left", padx=6)
+                      command=_confirm_and_print).pack(side="left", padx=6)
 
         ctk.CTkButton(btn_row, text="🖨️  Reprint", width=100, height=42,
                       fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
                       text_color=COLORS["text_primary"], corner_radius=9,
                       font=ctk.CTkFont("Helvetica", 12),
-                      command=_do_print).pack(side="left", padx=6)
+                      command=_confirm_and_print).pack(side="left", padx=6)
 
         ctk.CTkButton(btn_row, text="💾 Save", width=80, height=42,
                       fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
@@ -3590,11 +3708,11 @@ class BlazeBiteApp(ctk.CTk):
                       font=ctk.CTkFont("Helvetica", 12),
                       command=_save_text_copy).pack(side="left", padx=6)
 
-        ctk.CTkButton(btn_row, text="✖ Close", width=80, height=42,
+        ctk.CTkButton(btn_row, text="✖ Cancel", width=80, height=42,
                       fg_color=COLORS["border"], hover_color=COLORS["bg_card"],
                       text_color=COLORS["text_primary"], corner_radius=9,
                       font=ctk.CTkFont("Helvetica", 12),
-                      command=win.destroy).pack(side="left", padx=6)
+                      command=_cancel_receipt).pack(side="left", padx=6)
 
     # ═══════════════════════════════════════════
     #  ADMIN VIEW
@@ -4370,6 +4488,69 @@ class BlazeBiteApp(ctk.CTk):
                      font=ctk.CTkFont("Helvetica", 15, "bold"),
                      text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 6))
 
+        # ── Date filter + download row ──
+        log_filter_row = ctk.CTkFrame(log_section, fg_color="transparent")
+        log_filter_row.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkLabel(log_filter_row, text="From:",
+                     font=ctk.CTkFont("Helvetica", 12),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(0, 4))
+
+        self._log_from_var = ctk.StringVar(value="")
+        log_from_entry = ctk.CTkEntry(log_filter_row, textvariable=self._log_from_var,
+                                      width=110, height=30, placeholder_text="YYYY-MM-DD",
+                                      fg_color=COLORS["bg_panel"], text_color=COLORS["text_primary"],
+                                      border_color=COLORS["border"])
+        log_from_entry.pack(side="left", padx=(0, 2))
+
+        ctk.CTkButton(log_filter_row, text="\U0001f4c5", width=30, height=30,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      command=lambda: DatePickerPopup(
+                          self, lambda d: self._log_from_var.set(d),
+                          self._log_from_var.get() or None,
+                      )).pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(log_filter_row, text="To:",
+                     font=ctk.CTkFont("Helvetica", 12),
+                     text_color=COLORS["text_muted"]).pack(side="left", padx=(0, 4))
+
+        self._log_to_var = ctk.StringVar(value="")
+        log_to_entry = ctk.CTkEntry(log_filter_row, textvariable=self._log_to_var,
+                                    width=110, height=30, placeholder_text="YYYY-MM-DD",
+                                    fg_color=COLORS["bg_panel"], text_color=COLORS["text_primary"],
+                                    border_color=COLORS["border"])
+        log_to_entry.pack(side="left", padx=(0, 2))
+
+        ctk.CTkButton(log_filter_row, text="\U0001f4c5", width=30, height=30,
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      command=lambda: DatePickerPopup(
+                          self, lambda d: self._log_to_var.set(d),
+                          self._log_to_var.get() or None,
+                      )).pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(log_filter_row, text="Filter", width=70, height=30,
+                      corner_radius=8,
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+                      text_color="#0A0E27",
+                      command=self._filter_activity_logs).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(log_filter_row, text="Show All", width=70, height=30,
+                      corner_radius=8,
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      fg_color=COLORS["bg_hover"], hover_color=COLORS["border"],
+                      text_color=COLORS["text_primary"],
+                      command=self._reset_activity_log_filter).pack(side="left", padx=(0, 14))
+
+        ctk.CTkButton(log_filter_row, text="\u2b07 Download CSV", width=130, height=30,
+                      corner_radius=8,
+                      font=ctk.CTkFont("Helvetica", 11, "bold"),
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_glow"],
+                      text_color="#0A0E27",
+                      command=self._download_activity_log_csv).pack(side="right")
+
         log_cols = ("Time", "Actor", "Role", "Action", "Target", "Details", "Store")
         self.root_log_tree = ttk.Treeview(log_section, columns=log_cols, show="headings", height=10,
                                           style="Custom.Treeview")
@@ -4392,7 +4573,7 @@ class BlazeBiteApp(ctk.CTk):
                      text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 2))
 
         ctk.CTkLabel(sync_section,
-                     text="All data is stored locally. Sync copies backups to your cloud folder (OneDrive / Google Drive / Dropbox).",
+                     text="Backups are automatic — saved to your cloud folder (OneDrive / Google Drive / Dropbox) when available, or locally when offline.",
                      font=ctk.CTkFont("Helvetica", 10),
                      text_color=COLORS["text_muted"]).pack(anchor="w", padx=12, pady=(0, 8))
 
@@ -4507,6 +4688,64 @@ class BlazeBiteApp(ctk.CTk):
             command=self._logout_admin,
         ).pack(pady=(0, 16))
 
+    def _filter_activity_logs(self):
+        """Reload the activity log tree with the selected date filter."""
+        date_from = self._log_from_var.get().strip()
+        date_to = self._log_to_var.get().strip()
+        logs = self.db.get_activity_logs_filtered(date_from, date_to)
+        self._populate_log_tree(logs)
+
+    def _reset_activity_log_filter(self):
+        """Clear date filters and reload all activity logs."""
+        self._log_from_var.set("")
+        self._log_to_var.set("")
+        logs = self.db.get_activity_logs_filtered()
+        self._populate_log_tree(logs)
+
+    def _populate_log_tree(self, logs):
+        if not hasattr(self, "root_log_tree"):
+            return
+        for row in self.root_log_tree.get_children():
+            self.root_log_tree.delete(row)
+        for _id, timestamp, actor_username, actor_role, action, target, details, store in logs:
+            self.root_log_tree.insert("", "end",
+                                     values=(timestamp, actor_username, actor_role, action, target, details, store))
+
+    def _download_activity_log_csv(self):
+        """Export current activity log view (filtered or all) to a CSV file."""
+        date_from = self._log_from_var.get().strip()
+        date_to = self._log_to_var.get().strip()
+        logs = self.db.get_activity_logs_filtered(date_from, date_to)
+
+        if not logs:
+            messagebox.showinfo("No Data", "No activity logs found for the selected period.")
+            return
+
+        from tkinter import filedialog
+        if date_from or date_to:
+            tag = f"{date_from or 'start'}_to_{date_to or 'now'}"
+        else:
+            tag = "all"
+        default_name = f"ActivityLog_{tag}.csv"
+        filepath = filedialog.asksaveasfilename(
+            title="Save Activity Log",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            initialfile=default_name,
+        )
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["ID", "Timestamp", "Actor", "Role", "Action", "Target", "Details", "Store"])
+                for row in logs:
+                    writer.writerow(row)
+            messagebox.showinfo("Exported", f"Activity log saved to:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+
     def _refresh_root_admin(self):
         if getattr(self, "current_role", None) != "root_admin":
             return
@@ -4519,10 +4758,10 @@ class BlazeBiteApp(ctk.CTk):
                 self.root_user_tree.insert("", "end", values=(uid, store, role, username, status))
 
         if hasattr(self, "root_log_tree"):
-            for row in self.root_log_tree.get_children():
-                self.root_log_tree.delete(row)
-            for _id, timestamp, actor_username, actor_role, action, target, details, store in self.db.get_activity_logs():
-                self.root_log_tree.insert("", "end", values=(timestamp, actor_username, actor_role, action, target, details, store))
+            date_from = self._log_from_var.get().strip() if hasattr(self, "_log_from_var") else ""
+            date_to = self._log_to_var.get().strip() if hasattr(self, "_log_to_var") else ""
+            logs = self.db.get_activity_logs_filtered(date_from, date_to)
+            self._populate_log_tree(logs)
 
         if hasattr(self, "root_items_tree"):
             self._populate_system_items_tree(
@@ -7243,7 +7482,7 @@ class BlazeBiteApp(ctk.CTk):
         _field_label("STORE")
         seg_outer = ctk.CTkFrame(form, fg_color=COLORS["bg_panel"], corner_radius=10,
                                  border_width=1, border_color=COLORS["border"])
-        seg_outer.pack(fill="x", padx=40, pady=(0, 22))
+        seg_outer.pack(fill="x", padx=20, pady=(0, 22))
 
         store_options = list(STORE_LABELS.values()) + ["System"]
         store_btns: dict[str, ctk.CTkButton] = {}
@@ -7259,7 +7498,7 @@ class BlazeBiteApp(ctk.CTk):
             _update_login_hint()
 
         for idx, s in enumerate(store_options):
-            seg_outer.columnconfigure(idx, weight=1)
+            seg_outer.columnconfigure(idx, weight=max(len(s), 6))
         for idx, s in enumerate(store_options):
             is_active = s == store_var.get()
             sb = ctk.CTkButton(
@@ -7267,10 +7506,10 @@ class BlazeBiteApp(ctk.CTk):
                 fg_color=COLORS["accent"] if is_active else "transparent",
                 hover_color=COLORS["bg_hover"],
                 text_color="#0A0E27" if is_active else COLORS["text_secondary"],
-                font=ctk.CTkFont("Helvetica", 12, "bold"),
+                font=ctk.CTkFont("Helvetica", 10, "bold"),
                 command=lambda l=s: _pick_store(l),
             )
-            sb.grid(row=0, column=idx, padx=3, pady=3, sticky="ew")
+            sb.grid(row=0, column=idx, padx=2, pady=3, sticky="ew")
             store_btns[s] = sb
 
         # ── Role card selector ──

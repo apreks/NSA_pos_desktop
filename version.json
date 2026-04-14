@@ -1,0 +1,6 @@
+{
+  "version": "1.1.0",
+  "download_url": "https://myserver.com/pos/POS_Setup.exe",
+  "release_notes": "Bug fixes and improvements\n• Faster receipt printing\n• Fixed tax calculation rounding\n• Improved cloud sync reliability",
+  "min_version": "1.0.0"
+}
