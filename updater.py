@@ -17,10 +17,9 @@ from version import VERSION
 
 # ── Configuration ──────────────────────────────────────────────────
 UPDATE_CHECK_URLS = [
-    "https://cdn.jsdelivr.net/gh/apreks/NSA_pos_desktop@master/version.json",
-    "https://raw.githubusercontent.com/apreks/NSA_pos_desktop/master/version.json",
+    "https://github.com/apreks/NSA_pos_desktop/releases/latest/download/version.json",
 ]
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = 15  # seconds
 
 
 # ── Helpers ────────────────────────────────────────────────────────
