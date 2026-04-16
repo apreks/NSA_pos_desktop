@@ -16,7 +16,10 @@ import customtkinter as ctk
 from version import VERSION
 
 # ── Configuration ──────────────────────────────────────────────────
-UPDATE_CHECK_URL = "https://raw.githubusercontent.com/apreks/NSA_pos_desktop/master/version.json"
+UPDATE_CHECK_URLS = [
+    "https://cdn.jsdelivr.net/gh/apreks/NSA_pos_desktop@master/version.json",
+    "https://raw.githubusercontent.com/apreks/NSA_pos_desktop/master/version.json",
+]
 REQUEST_TIMEOUT = 10  # seconds
 
 
@@ -91,9 +94,18 @@ def check_for_updates(app_instance, colors: dict, is_transaction_active: bool = 
 def _check_worker(app, colors):
     """Run on a daemon thread — fetch version info, then schedule UI on main thread."""
     try:
-        resp = requests.get(UPDATE_CHECK_URL, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        info = resp.json()
+        info = None
+        for update_url in UPDATE_CHECK_URLS:
+            try:
+                resp = requests.get(update_url, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                info = resp.json()
+                break
+            except Exception:
+                continue
+
+        if not info:
+            return
 
         remote_ver = info.get("version", "")
         download_url = info.get("download_url", "")
