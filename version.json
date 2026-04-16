@@ -1,6 +1,6 @@
 {
-  "version": "1.1.0",
-  "download_url": "https://myserver.com/pos/POS_Setup.exe",
-  "release_notes": "Bug fixes and improvements\n• Faster receipt printing\n• Fixed tax calculation rounding\n• Improved cloud sync reliability",
+  "version": "1.2.0",
+  "download_url": "https://raw.githubusercontent.com/apreks/NSA_pos_desktop/master/release/POS_Setup.exe",
+  "release_notes": "UI and operations update\n• Modernized interface across login, sales, and admin screens\n• Faster navigation with reduced refresh lag\n• Admin item views are now limited to the active store\n• Root admin retains full system-wide item access\n• Existing data remains preserved in %APPDATA%\\NSAFastFood",
   "min_version": "1.0.0"
 }

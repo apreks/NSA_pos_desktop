@@ -1,52 +1,54 @@
 ========================================
-  NSA FAST FOOD - POS System v1.0
+  NSA FAST FOOD - POS System v1.2.0
 ========================================
 
 QUICK START
 -----------
-1. Run "Setup.bat" to create Desktop & Start Menu shortcuts
+1. Run "Setup.bat" to create Desktop and Start Menu shortcuts
 2. Double-click "NSA Fast Food" on your Desktop to launch
 
-OR just run "Launch.bat" directly from this folder.
+Or run "Launch.bat" directly from this folder.
 
 
-DEFAULT LOGIN CREDENTIALS
--------------------------
-Fast Food Store:
-  Attendant:  ff_attendant / ff_pass
-  Admin:      ff_admin / admin123
-
-Cold Store:
-  Attendant:  cs_attendant / cs_pass
-  Admin:      cs_admin / admin123
-
-Root Admin:   root_admin / root123
+WHAT'S NEW IN v1.2.0
+--------------------
+- Modernized interface across login, sales, and admin screens
+- Faster navigation with reduced refresh lag
+- Admin item views now stay limited to the active store
+- Root admin keeps full system-wide item access
 
 
 SYSTEM REQUIREMENTS
 -------------------
 - Windows 10 or later (64-bit)
-- No additional software needed (everything is bundled)
+- No additional software needed
 
 
 DATA LOCATION
 -------------
-All app data (database, settings, backups) is stored at:
+All app data, settings, invoices, and backups are stored at:
   %APPDATA%\NSAFastFood\
 
-This means your data is preserved even if you update the app.
+This means your data is preserved when the application is updated.
 
 
 FILES IN THIS FOLDER
----------------------
-  Setup.bat      - Creates Desktop & Start Menu shortcuts
+--------------------
+  Setup.bat      - Creates Desktop and Start Menu shortcuts
   Launch.bat     - Launches the app directly
-  Uninstall.bat  - Removes shortcuts (preserves data)
-  FastFoodPOS\   - Application files (do not modify)
+  Uninstall.bat  - Removes shortcuts only
+  FastFoodPOS\   - Application files
 
 
 UNINSTALL
 ---------
 1. Run "Uninstall.bat" to remove shortcuts
-2. Delete this entire folder
-3. (Optional) Delete %APPDATA%\NSAFastFood to remove data
+2. Delete this folder if you want to remove the app binaries
+3. Delete %APPDATA%\NSAFastFood only if you also want to remove data
+
+
+VERSION INFO
+------------
+Version:    1.2.0
+Build Date: April 16, 2026
+Built with: Python 3.14 + CustomTkinter + SQLite

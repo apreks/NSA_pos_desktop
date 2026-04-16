@@ -11,7 +11,7 @@ echo ║   NSA Fast Food POS - Uninstall           ║
 echo ╚═══════════════════════════════════════════╝
 echo.
 
-set "INSTALL_DIR=%ProgramFiles%\NSAFastFood"
+set "INSTALL_DIR=%LocalAppData%\Programs\NSAFastFood"
 set "DESKTOP=%USERPROFILE%\Desktop"
 set "START_MENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs\NSAFastFood"
 

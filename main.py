@@ -21,11 +21,25 @@ from tkinter import messagebox, ttk
 import tkinter as tk
 from reportlab.pdfgen import canvas
 from PIL import Image as PILImage, ImageTk
+import bcrypt
 try:
     from escpos.printer import Usb as EscposUsb
     HAS_ESCPOS = True
 except Exception:
     HAS_ESCPOS = False
+
+
+def _hash_password(plain: str) -> str:
+    """Return a bcrypt hash string for the given plain-text password."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _check_password(plain: str, hashed: str) -> bool:
+    """Verify a plain-text password against a bcrypt hash.
+    Falls back to plain-text comparison for un-migrated rows."""
+    if hashed.startswith("$2b$") or hashed.startswith("$2a$"):
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    return plain == hashed  # legacy plaintext — will be migrated on next seed
 
 # ─────────────────────────────────────────────
 #  APP DATA DIRECTORY SETUP
@@ -443,24 +457,27 @@ class Database:
         if role == "root_admin":
             cur = self.conn.execute(
                 """
-                SELECT id, store, role, username
+                SELECT id, store, role, username, password
                 FROM users
-                WHERE role=? AND username=? AND password=? AND COALESCE(disabled,0)=0
+                WHERE role=? AND username=? AND COALESCE(disabled,0)=0
                 LIMIT 1
                 """,
-                ("root_admin", username, password),
+                ("root_admin", username),
             )
         else:
             cur = self.conn.execute(
                 """
-                SELECT id, store, role, username
+                SELECT id, store, role, username, password
                 FROM users
-                WHERE store=? AND role=? AND username=? AND password=? AND COALESCE(disabled,0)=0
+                WHERE store=? AND role=? AND username=? AND COALESCE(disabled,0)=0
                 LIMIT 1
                 """,
-                (store, role, username, password),
+                (store, role, username),
             )
-        return cur.fetchone()
+        row = cur.fetchone()
+        if row and _check_password(password, row[4]):
+            return row[:4]  # (id, store, role, username)
+        return None
 
     def get_users(self, store: str):
         cur = self.conn.execute(
@@ -481,15 +498,16 @@ class Database:
 
     def add_or_update_user(self, store: str, role: str, username: str, password: str, create_if_missing: bool = False):
         existing = self.get_user(store, role)
+        hashed = _hash_password(password)
         if existing:
             self.conn.execute(
                 "UPDATE users SET username=?, password=? WHERE id=?",
-                (username, password, existing[0]),
+                (username, hashed, existing[0]),
             )
         elif create_if_missing:
             self.conn.execute(
                 "INSERT INTO users (store, role, username, password) VALUES (?, ?, ?, ?)",
-                (store, role, username, password),
+                (store, role, username, hashed),
             )
         else:
             raise ValueError("User does not exist")
@@ -502,7 +520,7 @@ class Database:
     def add_user(self, store: str, role: str, username: str, password: str, must_change_password: int = 0):
         self.conn.execute(
             "INSERT INTO users (store, role, username, password, disabled, must_change_password) VALUES (?, ?, ?, ?, 0, ?)",
-            (store, role, username, password, must_change_password),
+            (store, role, username, _hash_password(password), must_change_password),
         )
         self.conn.commit()
 
@@ -523,7 +541,7 @@ class Database:
     def update_password(self, user_id: int, new_password: str):
         self.conn.execute(
             "UPDATE users SET password=? WHERE id=?",
-            (new_password, user_id),
+            (_hash_password(new_password), user_id),
         )
         self.conn.commit()
 
@@ -741,6 +759,20 @@ class Database:
         existing_root = self.get_user("system", "root_admin")
         if not existing_root:
             self.add_user("system", "root_admin", "root_admin", "root123")
+
+        # Migrate any legacy plaintext passwords to bcrypt
+        self._migrate_plaintext_passwords()
+
+    def _migrate_plaintext_passwords(self):
+        """One-time migration: hash any passwords that are still stored as plaintext."""
+        rows = self.conn.execute("SELECT id, password FROM users").fetchall()
+        for uid, pw in rows:
+            if not (pw.startswith("$2b$") or pw.startswith("$2a$")):
+                self.conn.execute(
+                    "UPDATE users SET password=? WHERE id=?",
+                    (_hash_password(pw), uid),
+                )
+        self.conn.commit()
 
     # ── Data Export / Import ────────────────────────────────────
     def export_all_data(self) -> dict:
@@ -1272,7 +1304,7 @@ class BlazeBiteApp(ctk.CTk):
 
         # Silent background update check
         from updater import check_for_updates
-        check_for_updates(self, is_transaction_active=False)
+        check_for_updates(self, colors=COLORS, is_transaction_active=False)
 
         # Show login immediately
         self._show_login()
@@ -4098,8 +4130,8 @@ class BlazeBiteApp(ctk.CTk):
                       font=ctk.CTkFont("Helvetica", 11, "bold"),
                       command=self._do_restore_backup).pack(side="left")
 
-        # All-system item list (read-only)
-        ctk.CTkLabel(admin_scroll, text="🧾  All System Items",
+        # Store item list (read-only for admins)
+        ctk.CTkLabel(admin_scroll, text="🧾  Store Items",
                      font=ctk.CTkFont("Helvetica", 16, "bold"),
                      text_color=COLORS["text_primary"]).pack(anchor="w", padx=20, pady=(16, 8))
 
@@ -4320,7 +4352,7 @@ class BlazeBiteApp(ctk.CTk):
                                      border_width=1, border_color=COLORS["border"])
         items_section.pack(fill="both", expand=True, padx=16, pady=(0, 10))
 
-        ctk.CTkLabel(items_section, text="System Items",
+        ctk.CTkLabel(items_section, text="All System Items",
                      font=ctk.CTkFont("Helvetica", 15, "bold"),
                      text_color=COLORS["text_primary"]).pack(anchor="w", padx=12, pady=(10, 6))
 
@@ -6069,7 +6101,7 @@ class BlazeBiteApp(ctk.CTk):
             self.current_role or "admin",
             "ARCHIVE_PRODUCT" if archive else "UNARCHIVE_PRODUCT",
             item_name,
-            f"via_system_items_table={True}",
+            f"via_items_table={True}",
             store=store_key or "system",
         )
 
@@ -6086,9 +6118,13 @@ class BlazeBiteApp(ctk.CTk):
         for row in tree_widget.get_children():
             tree_widget.delete(row)
 
-        store_map = {"All": None}
-        store_map.update(STORE_KEYS)
-        selected_store = store_map.get(store_filter, None)
+        is_root_items_tree = tree_widget is getattr(self, "root_items_tree", None)
+        if self.current_role == "root_admin" and is_root_items_tree:
+            store_map = {"All": None}
+            store_map.update(STORE_KEYS)
+            selected_store = store_map.get(store_filter, None)
+        else:
+            selected_store = self.active_store
 
         for row in self.db.get_all_products(store=selected_store, include_archived=True):
             store = STORE_LABELS.get(row[6], row[6])

@@ -16,7 +16,7 @@ import customtkinter as ctk
 from version import VERSION
 
 # ── Configuration ──────────────────────────────────────────────────
-UPDATE_CHECK_URL = "https://myserver.com/pos/version.json"
+UPDATE_CHECK_URL = "https://raw.githubusercontent.com/apreks/NSA_pos_desktop/master/version.json"
 REQUEST_TIMEOUT = 10  # seconds
 
 
@@ -67,7 +67,7 @@ def _merge_and_save_setting(key: str, value):
 
 # ── Public API ─────────────────────────────────────────────────────
 
-def check_for_updates(app_instance, is_transaction_active: bool = False):
+def check_for_updates(app_instance, colors: dict, is_transaction_active: bool = False):
     """
     Kick off a silent background update check.
     Call from the main thread; the network + UI work is handled internally.
@@ -76,17 +76,19 @@ def check_for_updates(app_instance, is_transaction_active: bool = False):
     ----------
     app_instance : BlazeBiteApp (ctk.CTk)
         The running application window — used as parent for dialogs.
+    colors : dict
+        The COLORS theme dictionary from main.
     is_transaction_active : bool
         If True the check is skipped so an in-progress sale is never interrupted.
     """
     if is_transaction_active:
         return
-    threading.Thread(target=_check_worker, args=(app_instance,), daemon=True).start()
+    threading.Thread(target=_check_worker, args=(app_instance, colors), daemon=True).start()
 
 
 # ── Background worker ─────────────────────────────────────────────
 
-def _check_worker(app):
+def _check_worker(app, colors):
     """Run on a daemon thread — fetch version info, then schedule UI on main thread."""
     try:
         resp = requests.get(UPDATE_CHECK_URL, timeout=REQUEST_TIMEOUT)
@@ -110,7 +112,7 @@ def _check_worker(app):
             return
 
         # Schedule dialog on the main (UI) thread
-        app.after(0, lambda: _show_update_dialog(app, remote_ver, download_url, release_notes))
+        app.after(0, lambda: _show_update_dialog(app, colors, remote_ver, download_url, release_notes))
 
     except Exception:
         # Fail silently — no internet, server down, bad JSON, etc.
@@ -119,11 +121,9 @@ def _check_worker(app):
 
 # ── Update dialog ──────────────────────────────────────────────────
 
-def _show_update_dialog(app, new_version: str, download_url: str, release_notes: str):
+def _show_update_dialog(app, colors: dict, new_version: str, download_url: str, release_notes: str):
     """Display the update-available dialog (runs on the main thread)."""
-
-    # Import COLORS from main at call time to avoid circular imports
-    from main import COLORS
+    COLORS = colors
 
     dlg = ctk.CTkToplevel(app)
     dlg.title("Update Available")
@@ -200,7 +200,7 @@ def _show_update_dialog(app, new_version: str, download_url: str, release_notes:
         fg_color=COLORS["accent"],
         hover_color=COLORS["accent_glow"],
         text_color="#0A0E27",
-        command=lambda: _on_update_now(dlg, app, download_url, new_version),
+        command=lambda: _on_update_now(dlg, app, colors, download_url, new_version),
     ).pack(side="left", padx=(0, 8))
 
     ctk.CTkButton(
@@ -237,15 +237,15 @@ def _on_skip_version(dlg, version: str):
     dlg.destroy()
 
 
-def _on_update_now(dlg, app, download_url: str, new_version: str):
+def _on_update_now(dlg, app, colors, download_url: str, new_version: str):
     dlg.destroy()
-    _show_download_progress(app, download_url, new_version)
+    _show_download_progress(app, colors, download_url, new_version)
 
 
 # ── Download progress window ──────────────────────────────────────
 
-def _show_download_progress(app, download_url: str, new_version: str):
-    from main import COLORS
+def _show_download_progress(app, colors: dict, download_url: str, new_version: str):
+    COLORS = colors
 
     state = {"cancelled": False, "thread": None}
 
@@ -390,9 +390,8 @@ def _update_progress_ui(progress_bar, status_label, pct, text):
 
 
 def _download_failed(win, status_label, cancel_btn):
-    from main import COLORS
     try:
-        status_label.configure(text="Download failed. Please try again later.", text_color=COLORS["error"])
+        status_label.configure(text="Download failed. Please try again later.", text_color="#FF5757")
         cancel_btn.configure(text="Close")
     except Exception:
         try:
