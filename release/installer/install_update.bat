@@ -79,20 +79,8 @@ copy /Y "%~dp0uninstall.bat" "%INSTALL_DIR%\uninstall.bat" >nul
 
 echo [3/4] Creating shortcuts...
 if not exist "%START_MENU%\NSAFastFood" mkdir "%START_MENU%\NSAFastFood"
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$WshShell = New-Object -ComObject WScript.Shell; ^
-    $Shortcut = $WshShell.CreateShortcut('%START_MENU%\NSAFastFood\NSA Fast Food POS.lnk'); ^
-    $Shortcut.TargetPath = '%INSTALL_DIR%\FastFoodPOS.exe'; ^
-    $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; ^
-    $Shortcut.IconLocation = '%INSTALL_DIR%\FastFoodPOS.exe'; ^
-    $Shortcut.Save()" 2>nul
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$WshShell = New-Object -ComObject WScript.Shell; ^
-    $Shortcut = $WshShell.CreateShortcut('%DESKTOP%\NSA Fast Food.lnk'); ^
-    $Shortcut.TargetPath = '%APP_EXE%'; ^
-    $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; ^
-    $Shortcut.IconLocation = '%APP_EXE%'; ^
-    $Shortcut.Save()" 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$WshShell = New-Object -ComObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%START_MENU%\NSAFastFood\NSA Fast Food POS.lnk'); $Shortcut.TargetPath = '%INSTALL_DIR%\FastFoodPOS.exe'; $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; $Shortcut.IconLocation = '%INSTALL_DIR%\FastFoodPOS.exe'; $Shortcut.Save()" 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$WshShell = New-Object -ComObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%DESKTOP%\NSA Fast Food.lnk'); $Shortcut.TargetPath = '%APP_EXE%'; $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; $Shortcut.IconLocation = '%APP_EXE%'; $Shortcut.Save()" 2>nul
 
 echo [4/4] Registering uninstaller information...
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\NSAFastFood" ^

@@ -105,22 +105,10 @@ if not exist "%START_MENU%\NSAFastFood" (
 )
 
 REM Create Start Menu shortcut using PowerShell (more reliable)
-powershell -Command ^
-    "$WshShell = New-Object -ComObject WScript.Shell; ^
-    $Shortcut = $WshShell.CreateShortcut('%START_MENU%\NSAFastFood\NSA Fast Food POS.lnk'); ^
-    $Shortcut.TargetPath = '%INSTALL_DIR%\FastFoodPOS.exe'; ^
-    $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; ^
-    $Shortcut.IconLocation = '%INSTALL_DIR%\FastFoodPOS.exe'; ^
-    $Shortcut.Save()" 2> nul
+powershell -Command "$WshShell = New-Object -ComObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%START_MENU%\NSAFastFood\NSA Fast Food POS.lnk'); $Shortcut.TargetPath = '%INSTALL_DIR%\FastFoodPOS.exe'; $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; $Shortcut.IconLocation = '%INSTALL_DIR%\FastFoodPOS.exe'; $Shortcut.Save()" 2> nul
 
 REM Create or refresh Desktop shortcut
-powershell -Command ^
-    "$WshShell = New-Object -ComObject WScript.Shell; ^
-    $Shortcut = $WshShell.CreateShortcut('%DESKTOP%\NSA Fast Food.lnk'); ^
-    $Shortcut.TargetPath = '%APP_EXE%'; ^
-    $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; ^
-    $Shortcut.IconLocation = '%APP_EXE%'; ^
-    $Shortcut.Save()" 2> nul
+powershell -Command "$WshShell = New-Object -ComObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%DESKTOP%\NSA Fast Food.lnk'); $Shortcut.TargetPath = '%APP_EXE%'; $Shortcut.WorkingDirectory = '%INSTALL_DIR%'; $Shortcut.IconLocation = '%APP_EXE%'; $Shortcut.Save()" 2> nul
 echo        Updated Desktop shortcut
 echo        Created Start Menu shortcut
 
