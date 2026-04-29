@@ -7,6 +7,7 @@ Designed to run entirely in the background — never freezes the UI, fails silen
 import os
 import sys
 import json
+import zipfile
 import threading
 import tempfile
 import subprocess
@@ -334,11 +335,11 @@ def _download_worker(app, win, url, progress_bar, status_label, cancel_btn, stat
     """Stream-download the installer, updating the progress bar via app.after()."""
     tmp_dir = tempfile.gettempdir()
     # Derive filename from URL, fallback to generic name
-    filename = url.rsplit("/", 1)[-1] if "/" in url else "POS_Setup.exe"
+    filename = url.rsplit("/", 1)[-1] if "/" in url else "POS_Update.zip"
     # Sanitize filename
     filename = "".join(c for c in filename if c.isalnum() or c in "._-")
     if not filename:
-        filename = "POS_Setup.exe"
+        filename = "POS_Update.zip"
     dest_path = os.path.join(tmp_dir, filename)
 
     try:
@@ -383,8 +384,8 @@ def _download_worker(app, win, url, progress_bar, status_label, cancel_btn, stat
                 pass
             return
 
-        # Download complete — launch installer
-        app.after(0, lambda: _launch_installer(win, dest_path))
+        # Download complete — launch update package (zip or exe)
+        app.after(0, lambda: _launch_update_package(win, dest_path))
 
     except Exception:
         # Fail silently — close progress window
@@ -411,18 +412,39 @@ def _download_failed(win, status_label, cancel_btn):
             pass
 
 
-def _launch_installer(win, installer_path: str):
-    """Close the progress window, launch the installer, and exit the app."""
+def _launch_update_package(win, package_path: str):
+    """Close the progress window, launch the updater package (ZIP/EXE), and exit the app."""
     try:
         win.destroy()
     except Exception:
         pass
 
     try:
-        subprocess.Popen(
-            [installer_path],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        )
+        lower = package_path.lower()
+        if lower.endswith(".zip"):
+            extract_dir = os.path.join(tempfile.gettempdir(), "NSAFastFood_Update")
+            if os.path.exists(extract_dir):
+                # Keep stale files from mixing with a new update package.
+                import shutil
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(package_path, "r") as archive:
+                archive.extractall(extract_dir)
+
+            install_bat = os.path.join(extract_dir, "install_update.bat")
+            if os.path.exists(install_bat):
+                subprocess.Popen(
+                    ["cmd.exe", "/c", install_bat],
+                    cwd=extract_dir,
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                raise FileNotFoundError("install_update.bat not found in update package")
+        else:
+            subprocess.Popen(
+                [package_path],
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
     except Exception:
         pass
 

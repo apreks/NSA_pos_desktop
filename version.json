@@ -1,6 +1,6 @@
 {
-  "version": "1.2.0",
-  "download_url": "https://github.com/apreks/NSA_pos_desktop/releases/latest/download/POS_Setup.exe",
-  "release_notes": "UI and operations update\n• Modernized interface across login, sales, and admin screens\n• Faster navigation with reduced refresh lag\n• Admin item views are now limited to the active store\n• Root admin retains full system-wide item access\n• Existing data remains preserved in %APPDATA%\\NSAFastFood",
+  "version": "1.2.1",
+  "download_url": "https://github.com/apreks/NSA_pos_desktop/releases/latest/download/POS_Update.zip",
+  "release_notes": "Operations update\n• Attendant History only shows orders after a successful receipt print\n• Cart quantities can now be typed directly, with digit-only validation\n• Installer now backs up %APPDATA%\\NSAFastFood before an in-place upgrade\n• Existing live data remains preserved during updates\n• Updater package switched to ZIP format to avoid installer EXE false-positive blocks",
   "min_version": "1.0.0"
 }
