@@ -7341,25 +7341,8 @@ class BlazeBiteApp(ctk.CTk):
 
         # ── Logic helpers (widgets referenced lazily via closure) ──
         def _update_login_hint(*_):
-            s_label = store_var.get()
-            s_key   = next((k for k, v in STORE_LABELS.items() if v == s_label), None)
-            if s_label == "System":
-                s_key = "system"
-            role = role_var.get().strip().lower().replace(" ", "_")
-            if role == "root_admin":
-                s_key = "system"
-            creds = CREDENTIALS.get(s_key, {}).get(role)
-            u = p = ""
-            if creds:
-                u, p = creds["user"], creds["pass"]
-            elif role == "root_admin":
-                u, p = "root_admin", "root123"
             username_entry.delete(0, "end")
-            if u:
-                username_entry.insert(0, u)
             password_entry.delete(0, "end")
-            if p:
-                password_entry.insert(0, p)
             status_lbl.configure(text="")
 
         def attempt_login():
